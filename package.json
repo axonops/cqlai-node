@@ -1,8 +1,30 @@
 {
-  "name": "cqlai-node",
-  "version": "0.1.0",
+  "name": "@axonops/cqlai-node",
+  "version": "0.1.1",
   "description": "Node.js bindings for CQLAI - Cassandra CQL shell",
+  "keywords": [
+    "cassandra",
+    "cql",
+    "database",
+    "nosql",
+    "scylla"
+  ],
+  "homepage": "https://github.com/axonops/cqlai-node#readme",
+  "bugs": {
+    "url": "https://github.com/axonops/cqlai-node/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axonops/cqlai-node.git"
+  },
+  "license": "Apache-2.0",
+  "author": "AxonOps",
+  "type": "commonjs",
   "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "lib": "lib"
+  },
   "files": [
     "index.js",
     "native.js",
@@ -20,26 +42,8 @@
   "dependencies": {
     "koffi": "^2.9.0"
   },
+  "devDependencies": {},
   "engines": {
     "node": ">=14.0.0"
-  },
-  "os": [
-    "linux"
-  ],
-  "cpu": [
-    "x64",
-    "arm64"
-  ],
-  "keywords": [
-    "cassandra",
-    "cql",
-    "database",
-    "nosql",
-    "scylla"
-  ],
-  "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/axonops/cqlai-node.git"
   }
 }
