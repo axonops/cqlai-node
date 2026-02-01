@@ -1,0 +1,45 @@
+{
+  "name": "cqlai-node",
+  "version": "0.1.0",
+  "description": "Node.js bindings for CQLAI - Cassandra CQL shell",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "native.js",
+    "session.js",
+    "lib/",
+    "go/",
+    "scripts/",
+    "docs/"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/build.js",
+    "build": "node scripts/build.js",
+    "test": "node -e \"const {CQLSession} = require('.'); console.log('CQLSession loaded:', typeof CQLSession)\""
+  },
+  "dependencies": {
+    "koffi": "^2.9.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "keywords": [
+    "cassandra",
+    "cql",
+    "database",
+    "nosql",
+    "scylla"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/axonops/cqlai-node.git"
+  }
+}

@@ -1,0 +1,6 @@
+node_modules/
+lib/*.so
+lib/*.dylib
+lib/*.dll
+lib/*.h
+*.log
