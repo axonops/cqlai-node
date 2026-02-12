@@ -1,0 +1,13 @@
+[connection]
+hostname = 127.0.0.1
+port = 9042
+
+[authentication]
+username = cassandra
+password = cassandra
+
+[ssl]
+certfile = /home/mhmd/Downloads/cassandra-with-ssl/ssl/server.crt.pem
+keyfile = /home/mhmd/Downloads/cassandra-with-ssl/ssl/server.key.pem
+ca_certs = /home/mhmd/Downloads/cassandra-with-ssl/ssl/ca.pem
+validate = false

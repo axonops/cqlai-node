@@ -1,5 +1,6 @@
 const koffi = require('koffi');
 const path = require('path');
+const fs = require('fs');
 
 // Determine library filename based on platform
 function getLibraryName() {
@@ -13,8 +14,23 @@ function getLibraryName() {
   }
 }
 
-// Determine library path (lib/ folder inside node package)
-const libPath = path.join(__dirname, 'lib', getLibraryName());
+// Determine library path, handling Electron ASAR unpacking
+function getLibraryPath() {
+  const libName = getLibraryName();
+  let libPath = path.join(__dirname, 'lib', libName);
+
+  // Handle Electron ASAR: unpacked files are at .asar.unpacked instead of .asar
+  if (libPath.includes('.asar') && !libPath.includes('.asar.unpacked')) {
+    const unpackedPath = libPath.replace('.asar', '.asar.unpacked');
+    if (fs.existsSync(unpackedPath)) {
+      return unpackedPath;
+    }
+  }
+
+  return libPath;
+}
+
+const libPath = getLibraryPath();
 
 // Load the native library
 const lib = koffi.load(libPath);

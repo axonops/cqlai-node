@@ -2,6 +2,7 @@ package main
 
 import (
 	"strings"
+	"sync"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/axonops/cqlai-node/internal/db"
@@ -115,12 +116,29 @@ type KeyspaceInfo struct {
 	Indexes             []IndexInfo            `json:"indexes"`
 }
 
+// RoleMetadata represents a role in the cluster
+type RoleMetadata struct {
+	Role        string   `json:"role"`
+	CanLogin    bool     `json:"can_login"`
+	IsSuperuser bool     `json:"is_superuser"`
+	MemberOf    []string `json:"member_of"`
+}
+
+// PermissionMetadata represents permissions granted to a role
+type PermissionMetadata struct {
+	Role        string   `json:"role"`
+	Resource    string   `json:"resource"`
+	Permissions []string `json:"permissions"`
+}
+
 // ClusterMetadata represents the full cluster metadata
 type ClusterMetadata struct {
-	ClusterName string         `json:"cluster_name"`
-	HostsInfo   []HostInfo     `json:"hosts_info"`
-	Partitioner string         `json:"partitioner"`
-	Keyspaces   []KeyspaceInfo `json:"keyspaces"`
+	ClusterName string               `json:"cluster_name"`
+	HostsInfo   []HostInfo           `json:"hosts_info"`
+	Partitioner string               `json:"partitioner"`
+	Keyspaces   []KeyspaceInfo       `json:"keyspaces"`
+	Roles       []RoleMetadata       `json:"roles"`
+	Permissions []PermissionMetadata `json:"permissions"`
 }
 
 // indexKey is used as a map key for index lookup
@@ -130,7 +148,7 @@ type indexKey struct {
 }
 
 // GetClusterMetadataFromSession extracts full cluster metadata using gocql's built-in metadata API
-// This leverages gocql's internal metadata caching for optimal performance
+// Uses parallel goroutines for independent queries to minimize latency
 func GetClusterMetadataFromSession(session *db.Session) (*ClusterMetadata, error) {
 	metadata := &ClusterMetadata{
 		HostsInfo: []HostInfo{},
@@ -145,17 +163,77 @@ func GetClusterMetadataFromSession(session *db.Session) (*ClusterMetadata, error
 	metadata.ClusterName = clusterName
 	metadata.Partitioner = partitioner
 
-	// Get hosts info
-	if err := getHostsInfo(session, metadata); err != nil {
-		return nil, err
-	}
+	// Run hosts, keyspaces, and roles/permissions in parallel
+	var wg sync.WaitGroup
+	var hostsErr, ksErr error
 
-	// Get all keyspaces using gocql's metadata API
-	if err := getKeyspacesUsingMetadataAPI(session, metadata); err != nil {
-		return nil, err
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		hostsErr = getHostsInfo(session, metadata)
+	}()
+
+	go func() {
+		defer wg.Done()
+		ksErr = getKeyspacesUsingMetadataAPI(session, metadata)
+	}()
+
+	go func() {
+		defer wg.Done()
+		getRolesAndPermissions(session, metadata)
+	}()
+
+	wg.Wait()
+
+	if hostsErr != nil {
+		return nil, hostsErr
+	}
+	if ksErr != nil {
+		return nil, ksErr
 	}
 
 	return metadata, nil
+}
+
+// getRolesAndPermissions fetches roles and permissions from system_auth.
+// Silently returns empty arrays if the user lacks authorization.
+func getRolesAndPermissions(session *db.Session, metadata *ClusterMetadata) {
+	metadata.Roles = []RoleMetadata{}
+	metadata.Permissions = []PermissionMetadata{}
+
+	// Fetch roles
+	roles, err := session.ListRoles()
+	if err == nil {
+		for _, r := range roles {
+			memberOf := r.MemberOf
+			if memberOf == nil {
+				memberOf = []string{}
+			}
+			metadata.Roles = append(metadata.Roles, RoleMetadata{
+				Role:        r.Role,
+				CanLogin:    r.CanLogin,
+				IsSuperuser: r.IsSuperuser,
+				MemberOf:    memberOf,
+			})
+		}
+	}
+
+	// Fetch permissions
+	permissions, err := session.ListPermissions()
+	if err == nil {
+		for _, p := range permissions {
+			perms := p.Permissions
+			if perms == nil {
+				perms = []string{}
+			}
+			metadata.Permissions = append(metadata.Permissions, PermissionMetadata{
+				Role:        p.Role,
+				Resource:    p.Resource,
+				Permissions: perms,
+			})
+		}
+	}
 }
 
 func getHostsInfo(session *db.Session, metadata *ClusterMetadata) error {
@@ -205,94 +283,151 @@ func getHostsInfo(session *db.Session, metadata *ClusterMetadata) error {
 
 // getKeyspacesUsingMetadataAPI uses gocql's built-in metadata caching
 // Combined with supplementary queries for indexes and triggers (not in gocql metadata)
+// Uses parallel goroutines to minimize query latency
 func getKeyspacesUsingMetadataAPI(session *db.Session, metadata *ClusterMetadata) error {
-	// Get list of all keyspaces (1 query)
-	keyspaceNames := []string{}
-	ksIter := session.Query("SELECT keyspace_name FROM system_schema.keyspaces").Iter()
-	var ksName string
-	for ksIter.Scan(&ksName) {
-		keyspaceNames = append(keyspaceNames, ksName)
-	}
-	ksIter.Close()
+	// Phase 1: Fetch keyspace names and supplementary data in parallel
+	var (
+		keyspaceNames    []string
+		virtualKeyspaces = make(map[string]bool)
+		indexMap         = make(map[indexKey][]IndexInfo)
+		triggerMap       = make(map[indexKey][]TriggerInfo)
+		virtualTables    = make(map[string][]TableInfo)
+		virtualColumns   = make(map[indexKey][]ColumnInfo)
+		mu               sync.Mutex
+	)
 
-	// Also get virtual keyspaces
-	virtualKeyspaces := make(map[string]bool)
-	virtualKsIter := session.Query("SELECT keyspace_name FROM system_virtual_schema.keyspaces").Iter()
-	for virtualKsIter.Scan(&ksName) {
-		keyspaceNames = append(keyspaceNames, ksName)
-		virtualKeyspaces[ksName] = true
-	}
-	virtualKsIter.Close()
+	var wg sync.WaitGroup
+	var ksErr error
 
-	// Pre-fetch all indexes (gocql metadata doesn't include them)
-	indexMap := make(map[indexKey][]IndexInfo)
-	idxIter := session.Query("SELECT keyspace_name, table_name, index_name, kind, options FROM system_schema.indexes").Iter()
-	var idxKs, idxTable, idxName, idxKind string
-	var idxOptions map[string]string
-	for idxIter.Scan(&idxKs, &idxTable, &idxName, &idxKind, &idxOptions) {
-		key := indexKey{keyspace: idxKs, table: idxTable}
-		indexMap[key] = append(indexMap[key], IndexInfo{
-			Name:    idxName,
-			Kind:    idxKind,
-			Options: idxOptions,
-		})
-	}
-	idxIter.Close()
-
-	// Pre-fetch all triggers
-	triggerMap := make(map[indexKey][]TriggerInfo)
-	trigIter := session.Query("SELECT keyspace_name, table_name, trigger_name, options FROM system_schema.triggers").Iter()
-	var trigKs, trigTable, trigName string
-	var trigOptions map[string]string
-	for trigIter.Scan(&trigKs, &trigTable, &trigName, &trigOptions) {
-		key := indexKey{keyspace: trigKs, table: trigTable}
-		optionsInterface := make(map[string]interface{})
-		for k, v := range trigOptions {
-			optionsInterface[k] = v
+	// Fetch regular keyspace names
+	wg.Add(6)
+	go func() {
+		defer wg.Done()
+		var names []string
+		iter := session.Query("SELECT keyspace_name FROM system_schema.keyspaces").Iter()
+		var name string
+		for iter.Scan(&name) {
+			names = append(names, name)
 		}
-		triggerMap[key] = append(triggerMap[key], TriggerInfo{
-			Name:    trigName,
-			Options: optionsInterface,
-		})
-	}
-	trigIter.Close()
+		if err := iter.Close(); err != nil {
+			ksErr = err
+			return
+		}
+		mu.Lock()
+		keyspaceNames = append(keyspaceNames, names...)
+		mu.Unlock()
+	}()
 
-	// Pre-fetch virtual tables metadata (gocql doesn't support virtual schema)
-	virtualTables := make(map[string][]TableInfo)
-	virtualColumns := make(map[indexKey][]ColumnInfo)
+	// Fetch virtual keyspace names
+	go func() {
+		defer wg.Done()
+		var names []string
+		iter := session.Query("SELECT keyspace_name FROM system_virtual_schema.keyspaces").Iter()
+		var name string
+		for iter.Scan(&name) {
+			names = append(names, name)
+			mu.Lock()
+			virtualKeyspaces[name] = true
+			mu.Unlock()
+		}
+		iter.Close()
+		mu.Lock()
+		keyspaceNames = append(keyspaceNames, names...)
+		mu.Unlock()
+	}()
 
-	vtIter := session.Query("SELECT keyspace_name, table_name, comment FROM system_virtual_schema.tables").Iter()
-	var vtKs, vtTable, vtComment string
-	for vtIter.Scan(&vtKs, &vtTable, &vtComment) {
-		virtualTables[vtKs] = append(virtualTables[vtKs], TableInfo{
-			Name:            vtTable,
-			Virtual:         true,
-			IsCQLCompatible: false,
-			PrimaryKey:      []KeyInfo{},
-			PartitionKey:    []KeyInfo{},
-			ClusteringKey:   []KeyInfo{},
-			Columns:         []ColumnInfo{},
-			Indexes:         []IndexInfo{},
-			Triggers:        []TriggerInfo{},
-			Views:           []string{},
-			Options:         make(map[string]interface{}),
-		})
-	}
-	vtIter.Close()
+	// Fetch indexes
+	go func() {
+		defer wg.Done()
+		iter := session.Query("SELECT keyspace_name, table_name, index_name, kind, options FROM system_schema.indexes").Iter()
+		var idxKs, idxTable, idxName, idxKind string
+		var idxOptions map[string]string
+		for iter.Scan(&idxKs, &idxTable, &idxName, &idxKind, &idxOptions) {
+			key := indexKey{keyspace: idxKs, table: idxTable}
+			mu.Lock()
+			indexMap[key] = append(indexMap[key], IndexInfo{
+				Name:    idxName,
+				Kind:    idxKind,
+				Options: idxOptions,
+			})
+			mu.Unlock()
+		}
+		iter.Close()
+	}()
 
-	vcIter := session.Query("SELECT keyspace_name, table_name, column_name, type, kind, position FROM system_virtual_schema.columns").Iter()
-	var vcKs, vcTable, vcName, vcType, vcKind string
-	var vcPos int
-	for vcIter.Scan(&vcKs, &vcTable, &vcName, &vcType, &vcKind, &vcPos) {
-		key := indexKey{keyspace: vcKs, table: vcTable}
-		virtualColumns[key] = append(virtualColumns[key], ColumnInfo{
-			Name:     vcName,
-			CQLType:  vcType,
-			Kind:     vcKind,
-			Position: vcPos,
-		})
+	// Fetch triggers
+	go func() {
+		defer wg.Done()
+		iter := session.Query("SELECT keyspace_name, table_name, trigger_name, options FROM system_schema.triggers").Iter()
+		var trigKs, trigTable, trigName string
+		var trigOptions map[string]string
+		for iter.Scan(&trigKs, &trigTable, &trigName, &trigOptions) {
+			key := indexKey{keyspace: trigKs, table: trigTable}
+			optionsInterface := make(map[string]interface{})
+			for k, v := range trigOptions {
+				optionsInterface[k] = v
+			}
+			mu.Lock()
+			triggerMap[key] = append(triggerMap[key], TriggerInfo{
+				Name:    trigName,
+				Options: optionsInterface,
+			})
+			mu.Unlock()
+		}
+		iter.Close()
+	}()
+
+	// Fetch virtual tables
+	go func() {
+		defer wg.Done()
+		iter := session.Query("SELECT keyspace_name, table_name, comment FROM system_virtual_schema.tables").Iter()
+		var vtKs, vtTable, vtComment string
+		for iter.Scan(&vtKs, &vtTable, &vtComment) {
+			mu.Lock()
+			virtualTables[vtKs] = append(virtualTables[vtKs], TableInfo{
+				Name:            vtTable,
+				Virtual:         true,
+				IsCQLCompatible: false,
+				PrimaryKey:      []KeyInfo{},
+				PartitionKey:    []KeyInfo{},
+				ClusteringKey:   []KeyInfo{},
+				Columns:         []ColumnInfo{},
+				Indexes:         []IndexInfo{},
+				Triggers:        []TriggerInfo{},
+				Views:           []string{},
+				Options:         make(map[string]interface{}),
+			})
+			mu.Unlock()
+		}
+		iter.Close()
+	}()
+
+	// Fetch virtual columns
+	go func() {
+		defer wg.Done()
+		iter := session.Query("SELECT keyspace_name, table_name, column_name, type, kind, position FROM system_virtual_schema.columns").Iter()
+		var vcKs, vcTable, vcName, vcType, vcKind string
+		var vcPos int
+		for iter.Scan(&vcKs, &vcTable, &vcName, &vcType, &vcKind, &vcPos) {
+			key := indexKey{keyspace: vcKs, table: vcTable}
+			mu.Lock()
+			virtualColumns[key] = append(virtualColumns[key], ColumnInfo{
+				Name:     vcName,
+				CQLType:  vcType,
+				Kind:     vcKind,
+				Position: vcPos,
+			})
+			mu.Unlock()
+		}
+		iter.Close()
+	}()
+
+	wg.Wait()
+
+	// Check critical errors
+	if ksErr != nil {
+		return ksErr
 	}
-	vcIter.Close()
 
 	// Populate virtual table columns and keys
 	for ksName, tables := range virtualTables {
@@ -300,7 +435,6 @@ func getKeyspacesUsingMetadataAPI(session *db.Session, metadata *ClusterMetadata
 			key := indexKey{keyspace: ksName, table: tables[i].Name}
 			if cols, ok := virtualColumns[key]; ok {
 				tables[i].Columns = cols
-				// Build primary key info from columns
 				for _, col := range cols {
 					keyInfo := KeyInfo{Name: col.Name, CQLType: col.CQLType}
 					if col.Kind == "partition_key" {
@@ -315,38 +449,73 @@ func getKeyspacesUsingMetadataAPI(session *db.Session, metadata *ClusterMetadata
 		}
 	}
 
-	// For each keyspace, use gocql's KeyspaceMetadata which uses internal cache
-	for _, ksName := range keyspaceNames {
-		isVirtual := virtualKeyspaces[ksName]
+	// Phase 2: Fetch per-keyspace metadata in parallel (bounded concurrency)
+	type ksResult struct {
+		index int
+		info  KeyspaceInfo
+		ok    bool
+	}
 
-		if isVirtual {
-			// Virtual keyspaces are not supported by gocql's metadata API
-			// Build KeyspaceInfo manually from pre-fetched data
-			ksInfo := KeyspaceInfo{
-				Name:                ksName,
-				Virtual:             true,
-				DurableWrites:       false,
-				ReplicationStrategy: map[string]interface{}{"class": "LocalStrategy"},
-				Tables:              virtualTables[ksName],
-				UserTypes:           []UserTypeInfo{},
-				Functions:           []FunctionInfo{},
-				Aggregates:          []AggregateInfo{},
-				Views:               []ViewInfo{},
-				Indexes:             []IndexInfo{},
+	resultCh := make(chan ksResult, len(keyspaceNames))
+	sem := make(chan struct{}, 5) // limit to 5 concurrent keyspace fetches
+
+	for i, name := range keyspaceNames {
+		go func(idx int, ksName string) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			isVirtual := virtualKeyspaces[ksName]
+
+			if isVirtual {
+				ksInfo := KeyspaceInfo{
+					Name:                ksName,
+					Virtual:             true,
+					DurableWrites:       false,
+					ReplicationStrategy: map[string]interface{}{"class": "LocalStrategy"},
+					Tables:              virtualTables[ksName],
+					UserTypes:           []UserTypeInfo{},
+					Functions:           []FunctionInfo{},
+					Aggregates:          []AggregateInfo{},
+					Views:               []ViewInfo{},
+					Indexes:             []IndexInfo{},
+				}
+				resultCh <- ksResult{index: idx, info: ksInfo, ok: true}
+				return
 			}
-			metadata.Keyspaces = append(metadata.Keyspaces, ksInfo)
-			continue
-		}
 
-		// Use gocql's metadata API - this leverages internal caching
-		ksMeta, err := session.KeyspaceMetadata(ksName)
-		if err != nil {
-			// Skip keyspaces we can't access (permissions, etc.)
-			continue
-		}
+			ksMeta, err := session.KeyspaceMetadata(ksName)
+			if err != nil {
+				resultCh <- ksResult{index: idx, ok: false}
+				return
+			}
 
-		ksInfo := convertKeyspaceMetadata(ksMeta, isVirtual, indexMap, triggerMap)
-		metadata.Keyspaces = append(metadata.Keyspaces, ksInfo)
+			ksInfo := convertKeyspaceMetadata(ksMeta, isVirtual, indexMap, triggerMap)
+			resultCh <- ksResult{index: idx, info: ksInfo, ok: true}
+		}(i, name)
+	}
+
+	// Collect results preserving order
+	results := make([]ksResult, 0, len(keyspaceNames))
+	for range keyspaceNames {
+		results = append(results, <-resultCh)
+	}
+
+	// Sort by index to maintain consistent ordering
+	ordered := make([]KeyspaceInfo, len(keyspaceNames))
+	validCount := 0
+	for _, r := range results {
+		if r.ok {
+			ordered[r.index] = r.info
+			validCount++
+		}
+	}
+
+	// Compact: only include valid results
+	for i, name := range keyspaceNames {
+		_ = name
+		if ordered[i].Name != "" {
+			metadata.Keyspaces = append(metadata.Keyspaces, ordered[i])
+		}
 	}
 
 	return nil
