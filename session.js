@@ -830,6 +830,67 @@ class CQLSession {
     return { success: false, error: result.error || `Keyspace '${keyspace}' does not exist` };
   }
 
+  async _do_copy(parts, original) {
+    // Parse COPY command: COPY table [(col1, col2)] TO|FROM 'filename' [WITH options]
+    const pattern = /COPY\s+(\S+)(?:\s*\(([^)]+)\))?\s+(TO|FROM)\s+(?:'([^']+)'|"([^"]+)"|(\S+))(?:\s+WITH\s+(.+?))?;?\s*$/i;
+    const match = original.match(pattern);
+
+    if (!match) {
+      return { success: false, error: "Invalid COPY syntax. Use: COPY table TO 'file.csv' or COPY table FROM 'file.csv' [WITH HEADER = true]" };
+    }
+
+    const table = match[1];
+    const columnsStr = match[2];
+    const direction = match[3].toUpperCase();
+    const filename = match[4] || match[5] || match[6];
+    const withStr = match[7];
+
+    // Parse columns
+    const columns = columnsStr
+      ? columnsStr.split(',').map(c => c.trim())
+      : undefined;
+
+    // Parse WITH options: key = value [AND key = value ...]
+    const options = {};
+    if (withStr) {
+      const optParts = withStr.split(/\s+AND\s+/i);
+      for (const part of optParts) {
+        const optMatch = part.match(/(\w+)\s*=\s*(?:'([^']*)'|"([^"]*)"|(\S+))/);
+        if (optMatch) {
+          const key = optMatch[1].toUpperCase();
+          const value = optMatch[2] ?? optMatch[3] ?? optMatch[4];
+          options[key] = value;
+        }
+      }
+    }
+
+    const params = { table, filename, options };
+    if (columns) params.columns = columns;
+    const paramsJSON = JSON.stringify(params);
+
+    let result;
+    if (direction === 'TO') {
+      result = await callNativeTrueAsync(native.CopyTo, this._handle, paramsJSON);
+    } else {
+      result = await callNativeTrueAsync(native.CopyFrom, this._handle, paramsJSON);
+    }
+
+    if (result.success) {
+      const data = result.data || {};
+      let message;
+      if (direction === 'TO') {
+        message = `Exported ${data.rows_exported || 0} rows to ${filename}`;
+      } else {
+        message = `Imported ${data.rows_imported || 0} rows from ${filename}`;
+        if (data.errors > 0) message += ` (${data.errors} insert errors)`;
+        if (data.parse_errors > 0) message += ` (${data.parse_errors} parse errors)`;
+      }
+      return this._textResponse(message, { command: 'copy', direction: direction.toLowerCase(), ...data });
+    }
+
+    return result;
+  }
+
   /**
    * Create a text response (for shell commands)
    * Includes both message (for display) and structured commandResult (for programmatic access)
@@ -929,6 +990,73 @@ class CQLSession {
    */
   async getClusterMetadata() {
     return await callNativeTrueAsync(native.GetClusterMetadata, this._handle);
+  }
+
+  /**
+   * Export table data to a CSV file (COPY TO)
+   * @param {string} table - Table name (can be keyspace.table)
+   * @param {string} filename - Output CSV file path
+   * @param {Object} [options] - Export options
+   * @param {string[]} [options.columns] - Specific columns to export (default: all)
+   * @param {boolean} [options.header=false] - Include column header row
+   * @param {string} [options.delimiter=','] - Column delimiter
+   * @param {string} [options.nullval='null'] - String to use for NULL values
+   * @param {number} [options.maxrows=-1] - Max rows to export (-1 for unlimited)
+   * @param {number} [options.pagesize=1000] - Rows per page for streaming
+   * @returns {Promise<Object>} { success, data?: { rows_exported }, error? }
+   */
+  async copyTo(table, filename, options = {}) {
+    const params = {
+      table,
+      filename,
+      columns: options.columns,
+      options: {},
+    };
+    // Map JS-friendly option names to COPY option keys
+    if (options.header !== undefined) params.options.HEADER = String(options.header);
+    if (options.delimiter !== undefined) params.options.DELIMITER = options.delimiter;
+    if (options.nullval !== undefined) params.options.NULLVAL = options.nullval;
+    if (options.maxrows !== undefined) params.options.MAXROWS = String(options.maxrows);
+    if (options.pagesize !== undefined) params.options.PAGESIZE = String(options.pagesize);
+
+    const paramsJSON = JSON.stringify(params);
+    return await callNativeTrueAsync(native.CopyTo, this._handle, paramsJSON);
+  }
+
+  /**
+   * Import data from a CSV file into a table (COPY FROM)
+   * @param {string} table - Table name (can be keyspace.table)
+   * @param {string} filename - Input CSV file path
+   * @param {Object} [options] - Import options
+   * @param {string[]} [options.columns] - Column names matching CSV columns (default: from header or schema)
+   * @param {boolean} [options.header=false] - CSV file has a header row
+   * @param {string} [options.delimiter=','] - Column delimiter
+   * @param {string} [options.nullval='null'] - String representing NULL values
+   * @param {number} [options.maxrows=-1] - Max rows to import (-1 for unlimited)
+   * @param {number} [options.skiprows=0] - Number of rows to skip at start
+   * @param {number} [options.chunksize=5000] - Progress reporting chunk size
+   * @param {number} [options.maxbatchsize=20] - Max rows per batch insert
+   * @param {number} [options.maxrequests=6] - Max concurrent batch workers
+   * @returns {Promise<Object>} { success, data?: { rows_imported, errors, parse_errors, skipped_rows }, error? }
+   */
+  async copyFrom(table, filename, options = {}) {
+    const params = {
+      table,
+      filename,
+      columns: options.columns,
+      options: {},
+    };
+    if (options.header !== undefined) params.options.HEADER = String(options.header);
+    if (options.delimiter !== undefined) params.options.DELIMITER = options.delimiter;
+    if (options.nullval !== undefined) params.options.NULLVAL = options.nullval;
+    if (options.maxrows !== undefined) params.options.MAXROWS = String(options.maxrows);
+    if (options.skiprows !== undefined) params.options.SKIPROWS = String(options.skiprows);
+    if (options.chunksize !== undefined) params.options.CHUNKSIZE = String(options.chunksize);
+    if (options.maxbatchsize !== undefined) params.options.MAXBATCHSIZE = String(options.maxbatchsize);
+    if (options.maxrequests !== undefined) params.options.MAXREQUESTS = String(options.maxrequests);
+
+    const paramsJSON = JSON.stringify(params);
+    return await callNativeTrueAsync(native.CopyFrom, this._handle, paramsJSON);
   }
 
   /**

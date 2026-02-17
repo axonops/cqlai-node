@@ -86,6 +86,10 @@ const native = {
   TestAstraConnectionWithID: lib.func('char* TestAstraConnectionWithID(const char* optionsJSON)'),
   CleanupAstraExtracted: lib.func('char* CleanupAstraExtracted(const char* extractedDir)'),
 
+  // COPY TO/FROM (CSV export/import)
+  CopyTo: lib.func('char* CopyTo(int handle, const char* paramsJSON)'),
+  CopyFrom: lib.func('char* CopyFrom(int handle, const char* paramsJSON)'),
+
   // Source file execution (CQL files)
   ExecuteSourceFiles: lib.func('char* ExecuteSourceFiles(int handle, const char* optionsJSON)'),
   GetSourceProgress: lib.func('char* GetSourceProgress(int handle)'),

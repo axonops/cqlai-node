@@ -2094,6 +2094,60 @@ func SplitCQL(cql *C.char) *C.char {
 	return jsonResponse(true, result, "", "")
 }
 
+//export CopyTo
+func CopyTo(handle C.int, paramsJSON *C.char) *C.char {
+	session := getSession(int(handle))
+	if session == nil {
+		return jsonResponse(false, nil, "Invalid session handle", "INVALID_HANDLE")
+	}
+
+	var params CopyParams
+	if err := json.Unmarshal([]byte(C.GoString(paramsJSON)), &params); err != nil {
+		return jsonResponse(false, nil, "Invalid params JSON: "+err.Error(), "INVALID_PARAMS")
+	}
+
+	if params.Table == "" || params.Filename == "" {
+		return jsonResponse(false, nil, "table and filename are required", "INVALID_PARAMS")
+	}
+
+	options := mergeCopyOptions(defaultCopyOptions(), params.Options)
+	result, err := executeCopyTo(session, params, options)
+	if err != nil {
+		return jsonResponse(false, nil, err.Error(), "COPY_ERROR")
+	}
+
+	return jsonResponse(true, result, "", "")
+}
+
+//export CopyFrom
+func CopyFrom(handle C.int, paramsJSON *C.char) *C.char {
+	session := getSession(int(handle))
+	if session == nil {
+		return jsonResponse(false, nil, "Invalid session handle", "INVALID_HANDLE")
+	}
+
+	var params CopyParams
+	if err := json.Unmarshal([]byte(C.GoString(paramsJSON)), &params); err != nil {
+		return jsonResponse(false, nil, "Invalid params JSON: "+err.Error(), "INVALID_PARAMS")
+	}
+
+	if params.Table == "" || params.Filename == "" {
+		return jsonResponse(false, nil, "table and filename are required", "INVALID_PARAMS")
+	}
+
+	options := mergeCopyOptions(defaultCopyOptions(), params.Options)
+	result, err := executeCopyFrom(session, params, options)
+	if err != nil {
+		if result != nil {
+			// Partial success - return result with error
+			return jsonResponse(false, result, err.Error(), "COPY_ERROR")
+		}
+		return jsonResponse(false, nil, err.Error(), "COPY_ERROR")
+	}
+
+	return jsonResponse(true, result, "", "")
+}
+
 //export FreeString
 func FreeString(str *C.char) {
 	C.free(unsafe.Pointer(str))
