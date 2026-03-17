@@ -834,6 +834,10 @@ func GetSessionInfo(handle C.int) *C.char {
 		return jsonResponse(false, nil, "Invalid session handle", "INVALID_HANDLE")
 	}
 
+	// Fetch cluster name, datacenter, and rack from system.local
+	var clusterName, datacenter, rack string
+	_ = session.Query("SELECT cluster_name, data_center, rack FROM system.local").Scan(&clusterName, &datacenter, &rack)
+
 	info := map[string]interface{}{
 		"cassandraVersion":  session.CassandraVersion(),
 		"keyspace":          session.Keyspace(),
@@ -844,6 +848,9 @@ func GetSessionInfo(handle C.int) *C.char {
 		"expand":            session.Expand(),
 		"username":          session.Username(),
 		"host":              session.Host(),
+		"clusterName":       clusterName,
+		"datacenter":        datacenter,
+		"rack":              rack,
 	}
 
 	return jsonResponse(true, info, "", "")
