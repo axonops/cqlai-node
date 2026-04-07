@@ -1,9 +1,9 @@
 module github.com/axonops/cqlai-node
 
-go 1.21
+go 1.26.1
 
 require (
-	github.com/apache/cassandra-gocql-driver/v2 v2.0.0
+	github.com/apache/cassandra-gocql-driver/v2 v2.1.0
 	github.com/stretchr/testify v1.9.0
 )
 
