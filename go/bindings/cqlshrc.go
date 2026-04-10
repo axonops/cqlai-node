@@ -122,11 +122,20 @@ func ParseCqlshrc(filePath string) (*CqlshrcConfig, error) {
 		case "ssl":
 			switch key {
 			case "certfile":
-				config.SSL.Certfile = value
-			case "keyfile":
-				config.SSL.Keyfile = value
-			case "ca_certs":
+				// In cqlshrc format, certfile is the CA certificate used to verify the server
 				config.SSL.CAFile = value
+			case "ca_certs":
+				// Alternative key name for CA certificate
+				config.SSL.CAFile = value
+			case "usercert":
+				// Client certificate for mutual TLS authentication
+				config.SSL.Certfile = value
+			case "userkey":
+				// Client private key for mutual TLS authentication
+				config.SSL.Keyfile = value
+			case "keyfile":
+				// Alternative key name for client private key
+				config.SSL.Keyfile = value
 			case "validate":
 				config.SSL.Validate = strings.ToLower(value) == "true"
 			case "version":
@@ -313,11 +322,20 @@ func ParseCqlshrcWithVariables(cqlshrcPath, manifestPath, valuesPath, workspaceI
 		case "ssl":
 			switch key {
 			case "certfile":
-				config.SSL.Certfile = value
-			case "keyfile":
-				config.SSL.Keyfile = value
-			case "ca_certs":
+				// In cqlshrc format, certfile is the CA certificate used to verify the server
 				config.SSL.CAFile = value
+			case "ca_certs":
+				// Alternative key name for CA certificate
+				config.SSL.CAFile = value
+			case "usercert":
+				// Client certificate for mutual TLS authentication
+				config.SSL.Certfile = value
+			case "userkey":
+				// Client private key for mutual TLS authentication
+				config.SSL.Keyfile = value
+			case "keyfile":
+				// Alternative key name for client private key
+				config.SSL.Keyfile = value
 			case "validate":
 				config.SSL.Validate = strings.ToLower(value) == "true"
 			case "version":
