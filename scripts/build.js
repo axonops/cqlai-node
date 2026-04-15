@@ -3,8 +3,6 @@
 const { execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
-
 const rootDir = path.join(__dirname, '..');
 const goDir = path.join(rootDir, 'go');
 const libDir = path.join(rootDir, 'lib');
@@ -43,8 +41,9 @@ console.log(`  Output: ${outputLib}`);
 
 try {
   // Build the shared library from Go source
+  // -ldflags="-s -w" strips debug symbols, reducing binary size by ~30%
   execSync(
-    `go build -buildmode=c-shared -o "${outputLib}" ./bindings/`,
+    `go build -buildmode=c-shared -ldflags="-s -w" -o "${outputLib}" ./bindings/`,
     {
       cwd: goDir,
       stdio: 'inherit',
