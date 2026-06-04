@@ -1279,16 +1279,14 @@ func generateCreateTable(ksName string, table ddlTableInfo, columns []ddlColumnI
 		return sortedColumns[i].Position < sortedColumns[j].Position
 	})
 
-	// Write column definitions
-	for i, col := range sortedColumns {
+	// Write column definitions. Every column line ends with a comma because
+	// a PRIMARY KEY clause always follows on its own line below.
+	for _, col := range sortedColumns {
 		sb.WriteString(fmt.Sprintf("    %s %s", quoteIdentifier(col.Name), col.Type))
 		if col.Kind == "static" {
 			sb.WriteString(" STATIC")
 		}
-		if i < len(sortedColumns)-1 {
-			sb.WriteString(",")
-		}
-		sb.WriteString("\n")
+		sb.WriteString(",\n")
 	}
 
 	// Build PRIMARY KEY
