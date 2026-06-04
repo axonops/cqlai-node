@@ -1279,19 +1279,8 @@ func generateCreateTable(ksName string, table ddlTableInfo, columns []ddlColumnI
 		return sortedColumns[i].Position < sortedColumns[j].Position
 	})
 
-	// Write column definitions
-	for i, col := range sortedColumns {
-		sb.WriteString(fmt.Sprintf("    %s %s", quoteIdentifier(col.Name), col.Type))
-		if col.Kind == "static" {
-			sb.WriteString(" STATIC")
-		}
-		if i < len(sortedColumns)-1 {
-			sb.WriteString(",")
-		}
-		sb.WriteString("\n")
-	}
-
-	// Build PRIMARY KEY
+	// Build PRIMARY KEY first so column-list comma handling knows whether
+	// a PRIMARY KEY clause will follow.
 	var partitionKey []string
 	var clusteringKey []string
 
@@ -1325,6 +1314,19 @@ func generateCreateTable(ksName string, table ddlTableInfo, columns []ddlColumnI
 		pkStr = partitionKey[0]
 	} else if len(partitionKey) > 1 {
 		pkStr = "(" + strings.Join(partitionKey, ", ") + ")"
+	}
+
+	// Write column definitions. Append a trailing comma on every line except
+	// the last one when no PRIMARY KEY clause will follow.
+	for i, col := range sortedColumns {
+		sb.WriteString(fmt.Sprintf("    %s %s", quoteIdentifier(col.Name), col.Type))
+		if col.Kind == "static" {
+			sb.WriteString(" STATIC")
+		}
+		if i < len(sortedColumns)-1 || pkStr != "" {
+			sb.WriteString(",")
+		}
+		sb.WriteString("\n")
 	}
 
 	if pkStr != "" {
