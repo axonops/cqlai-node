@@ -34,8 +34,8 @@ node scripts/build.js
 # Basic JS test (only verifies module loads)
 npm test
 
-# Go tests (from go/ directory)
-cd go && go test ./internal/...
+# Go tests, including the BDD suites (from go/ directory)
+cd go && go test ./internal/... ./test/...
 
 # Test with live Cassandra instance
 node -e "const { CQLSession } = require('.'); CQLSession.testConnection({ host: '127.0.0.1' }).then(r => console.log(r))"
@@ -122,6 +122,27 @@ Extensive metadata support in `go/internal/db/`:
 | `go/internal/db/` | Database operations, query execution |
 | `docs/API.md` | Complete API documentation |
 | `docs/BUILDING.md` | Build instructions and troubleshooting |
+
+## Syncing with cqlai
+
+`go/internal/{db,config,logger,session,vault,telemetry,validation}`,
+`go/test/bdd/features/vault-credentials.feature` and
+`go/test/bdd/steps/vault_steps_test.go` are copies of the same paths in
+[cqlai](https://github.com/axonops/cqlai), with the import path rewritten to
+`github.com/axonops/cqlai-node`. `internal/batch/cql_splitter.go` is node's own
+(it adds `SecondTokens`/`ThirdTokens`). To sync, copy the directories over,
+rewrite the imports, match `go.mod` versions, then re-apply these patches:
+
+- `config/config.go`: `SSLConfig.ServerName` (Astra SNI).
+- `db/db.go`: `createTLSConfig` uses `sslConfig.ServerName` when set;
+  `SessionOptions.Vault` passed to `vault.FromSettings`; `SetKeyspace` closes
+  `s.Session` rather than `s` so `USE` does not revoke the Vault lease.
+- `vault/vault.go`: `Settings` and `FromSettings` (Vault address and token from
+  the connect options, falling back to the environment).
+
+Node-only additions live in their own files: `go/internal/db/node.go`,
+`go/test/bdd/features/vault-settings.feature` and
+`go/test/bdd/steps/vault_settings_steps_test.go`.
 
 ## Requirements
 

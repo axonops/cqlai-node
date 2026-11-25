@@ -98,6 +98,9 @@ const native = {
   // Query tracing
   GetQueryTrace: lib.func('char* GetQueryTrace(int handle, const char* sessionID)'),
 
+  // Vault/OpenBao
+  RevokeVaultLeases: lib.func('char* RevokeVaultLeases()'),
+
   // Memory management
   FreeString: lib.func('void FreeString(char* str)'),
 };

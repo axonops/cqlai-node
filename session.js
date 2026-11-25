@@ -1,5 +1,25 @@
 const { native, callNativeAsync, callNativeTrueAsync } = require('./native');
 
+let revokeOnExitRegistered = false;
+
+// Revoke any Vault lease still open when the process exits normally, so the
+// database user it created does not outlive the application. 'exit' handlers
+// must be synchronous, hence the blocking call. 'exit' does not fire on an
+// unhandled signal or a crash; those leases run out at their TTL.
+function revokeVaultLeasesOnExit() {
+  if (revokeOnExitRegistered) {
+    return;
+  }
+  revokeOnExitRegistered = true;
+  process.once('exit', () => {
+    try {
+      native.RevokeVaultLeases();
+    } catch (err) {
+      // Nothing can be done about it while exiting.
+    }
+  });
+}
+
 /**
  * CQL Session - represents a connection to a Cassandra cluster
  */
@@ -51,10 +71,18 @@ class CQLSession {
    * @param {string} [options.password] - Password (plaintext or RSA-encrypted base64)
    * @param {string} [options.rsaPrivateKey] - PEM-encoded RSA private key for credential decryption
    * @param {string} [options.rsaPrivateKeyFile] - Path to RSA private key file for credential decryption
+   * @param {string} [options.vaultPath] - Read the username and password from this Vault/OpenBao path, e.g. database/creds/myrole
+   * @param {string} [options.vaultAddr] - Vault/OpenBao address (default: BAO_ADDR or VAULT_ADDR)
+   * @param {string} [options.vaultToken] - Vault/OpenBao token, plaintext or RSA-encrypted base64 (default: BAO_TOKEN, VAULT_TOKEN or ~/.vault-token)
+   * @param {string} [options.vaultNamespace] - Vault namespace (default: BAO_NAMESPACE or VAULT_NAMESPACE)
+   * @param {string} [options.vaultCaCert] - Path to the Vault CA certificate (default: BAO_CACERT or VAULT_CACERT)
    * @returns {Promise<Object>} { success, data?, error? }
    */
   static async testConnection(options = {}) {
     const optionsJSON = JSON.stringify(options);
+    if (options.vaultPath) {
+      revokeVaultLeasesOnExit();
+    }
 
     return await callNativeTrueAsync(native.TestConnection, optionsJSON);
   }
@@ -73,6 +101,9 @@ class CQLSession {
     }
 
     const optionsJSON = JSON.stringify(options);
+    if (options.vaultPath) {
+      revokeVaultLeasesOnExit();
+    }
 
     return await callNativeTrueAsync(native.TestConnectionWithID, optionsJSON);
   }
@@ -105,15 +136,23 @@ class CQLSession {
    * @param {number} [options.requestTimeout] - Request timeout in seconds
    * @param {string} [options.rsaPrivateKey] - PEM-encoded RSA private key for credential decryption
    * @param {string} [options.rsaPrivateKeyFile] - Path to RSA private key file for credential decryption
-   * @returns {Promise<Object>} { success, data?: CQLSession, error? }
+   * @param {string} [options.vaultPath] - Read the username and password from this Vault/OpenBao path, e.g. database/creds/myrole
+   * @param {string} [options.vaultAddr] - Vault/OpenBao address (default: BAO_ADDR or VAULT_ADDR)
+   * @param {string} [options.vaultToken] - Vault/OpenBao token, plaintext or RSA-encrypted base64 (default: BAO_TOKEN, VAULT_TOKEN or ~/.vault-token)
+   * @param {string} [options.vaultNamespace] - Vault namespace (default: BAO_NAMESPACE or VAULT_NAMESPACE)
+   * @param {string} [options.vaultCaCert] - Path to the Vault CA certificate (default: BAO_CACERT or VAULT_CACERT)
+   * @returns {Promise<Object>} { success, data?: CQLSession, error?, code? }
    */
   static async connect(options = {}) {
     const optionsJSON = JSON.stringify(options);
+    if (options.vaultPath) {
+      revokeVaultLeasesOnExit();
+    }
 
     const response = await callNativeTrueAsync(native.CreateSession, optionsJSON);
 
     if (!response.success || !response.data) {
-      return { success: false, error: response.error || 'Failed to create session' };
+      return { success: false, error: response.error || 'Failed to create session', code: response.code };
     }
 
     // Get session info to retrieve username and host
@@ -1101,9 +1140,19 @@ class CQLSession {
    * @returns {Promise<Object>} { success, error? }
    */
   async close() {
-    return await callNativeAsync(() =>
-      native.CloseSession(this._handle)
-    );
+    // Closing revokes the session's Vault lease, a network call, so it runs
+    // off the main thread.
+    return await callNativeTrueAsync(native.CloseSession, this._handle);
+  }
+
+  /**
+   * Revoke every Vault/OpenBao lease still open. close() already revokes a
+   * session's own lease; this is for shutting down without closing sessions.
+   * A lease the token may not revoke is left to expire at its TTL.
+   * @returns {Promise<Object>} { success }
+   */
+  static async revokeVaultLeases() {
+    return await callNativeTrueAsync(native.RevokeVaultLeases);
   }
 
   /**

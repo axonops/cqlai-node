@@ -24,11 +24,23 @@ type ColumnInfo struct {
 	DataType string
 	Kind     string
 	Position int
+	// ClusteringOrder is asc or desc for a clustering column, and none for
+	// any other.
+	ClusteringOrder string
 }
 
 // TableListInfo holds table list information for manual describe
 type TableListInfo struct {
-	Name           string
+	Name string
+
+	// Virtual is a table the node computes rather than stores. It has no
+	// compaction, compression or gc_grace_seconds: there is nothing on disk
+	// for any of them to apply to.
+	Virtual bool
+
+	// Keyspace is set where a list spans keyspaces.
+	Keyspace string
+
 	GcGrace        int
 	Compaction     map[string]string
 	Compression    map[string]string
@@ -44,7 +56,7 @@ func (s *Session) DescribeTableQuery(keyspace string, tableName string) (*TableI
 	var checkName string
 	if !checkIter.Scan(&checkName) {
 		_ = checkIter.Close()
-		
+
 		// Get available tables for better error message
 		availQuery := `SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?`
 		availIter := s.Query(availQuery, keyspace).Iter()
@@ -54,7 +66,7 @@ func (s *Session) DescribeTableQuery(keyspace string, tableName string) (*TableI
 			availableTables = append(availableTables, availName)
 		}
 		_ = availIter.Close()
-		
+
 		availableStr := "none"
 		if len(availableTables) > 0 {
 			availableStr = strings.Join(availableTables, ", ")
@@ -66,7 +78,7 @@ func (s *Session) DescribeTableQuery(keyspace string, tableName string) (*TableI
 	// Get table properties
 	tableQuery := `SELECT * FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?`
 	iter := s.Query(tableQuery, keyspace, tableName).Iter()
-	
+
 	tableProps := make(map[string]interface{})
 	if !iter.MapScan(tableProps) {
 		_ = iter.Close()
@@ -75,54 +87,70 @@ func (s *Session) DescribeTableQuery(keyspace string, tableName string) (*TableI
 	_ = iter.Close()
 
 	// Get columns
-	colQuery := `SELECT column_name, type, kind, position 
+	colQuery := `SELECT column_name, type, kind, position, clustering_order
 	            FROM system_schema.columns 
 	            WHERE keyspace_name = ? AND table_name = ?`
-	
+
 	colIter := s.Query(colQuery, keyspace, tableName).Iter()
-	
+
 	var columns []ColumnInfo
-	var partitionKeys []string
-	var clusteringKeys []string
-	
-	var colName, colType, colKind string
+
+	var colName, colType, colKind, colOrder string
 	var colPosition int
-	
-	for colIter.Scan(&colName, &colType, &colKind, &colPosition) {
+
+	for colIter.Scan(&colName, &colType, &colKind, &colPosition, &colOrder) {
 		columns = append(columns, ColumnInfo{
-			Name:     colName,
-			DataType: colType,
-			Kind:     colKind,
-			Position: colPosition,
+			Name:            colName,
+			DataType:        colType,
+			Kind:            colKind,
+			Position:        colPosition,
+			ClusteringOrder: colOrder,
 		})
-		
-		switch colKind {
-		case "partition_key":
-			partitionKeys = append(partitionKeys, colName)
-		case "clustering":
-			clusteringKeys = append(clusteringKeys, colName)
-		}
 	}
 	_ = colIter.Close()
 
 	// Sort columns: partition keys first, then clustering keys, then regular columns
 	sort.Slice(columns, func(i, j int) bool {
+		// Static columns with the regular ones: unlisted, a static column
+		// sorted with the partition key.
 		kindPriority := map[string]int{
 			"partition_key": 0,
 			"clustering":    1,
+			"static":        2,
 			"regular":       2,
 		}
-		
+
 		iPriority := kindPriority[columns[i].Kind]
 		jPriority := kindPriority[columns[j].Kind]
-		
+
 		if iPriority != jPriority {
 			return iPriority < jPriority
 		}
-		
-		// Within same kind, sort by position
-		return columns[i].Position < columns[j].Position
+
+		// Within same kind, sort by position, and the rest - all at -1 - by
+		// name, as Cassandra lists them
+		if columns[i].Position != columns[j].Position {
+			return columns[i].Position < columns[j].Position
+		}
+		return columns[i].Name < columns[j].Name
 	})
+
+	// Collect the key columns only after sorting. system_schema.columns is
+	// clustered by column_name, so it comes back alphabetically; taking the
+	// keys in iteration order gives "PRIMARY KEY ((a, b, c), x, y, z)" for a
+	// table declared as ((c, a, b), z, y, x). That is not the same table: the
+	// partition key order changes how rows are distributed and the clustering
+	// order changes how they are sorted on disk.
+	var partitionKeys []string
+	var clusteringKeys []string
+	for _, col := range columns {
+		switch col.Kind {
+		case "partition_key":
+			partitionKeys = append(partitionKeys, col.Name)
+		case "clustering":
+			clusteringKeys = append(clusteringKeys, col.Name)
+		}
+	}
 
 	return &TableInfo{
 		KeyspaceName:   keyspace,
@@ -219,6 +247,15 @@ func (s *Session) DescribeAllTablesQuery() ([]TableListInfo, error) {
 		tables = append(tables, *tableInfo)
 	}
 
+	// And the virtual tables, named the same way, which system_schema does not
+	// hold.
+	for _, keyspace := range s.VirtualKeyspaces() {
+		for _, t := range s.virtualTableList(keyspace) {
+			t.Name = keyspace + "." + t.Name
+			tables = append(tables, t)
+		}
+	}
+
 	// Sort by keyspace and table name
 	sort.Slice(tables, func(i, j int) bool {
 		return tables[i].Name < tables[j].Name
@@ -229,6 +266,12 @@ func (s *Session) DescribeAllTablesQuery() ([]TableListInfo, error) {
 
 // DescribeTablesQuery executes queries to list all tables (for pre-4.0)
 func (s *Session) DescribeTablesQuery(keyspace string) ([]TableListInfo, error) {
+	// A virtual keyspace's tables are in system_virtual_schema, and asking
+	// system_schema for them answers that there are none.
+	if s.IsVirtualKeyspace(keyspace) {
+		return s.virtualTableList(keyspace), nil
+	}
+
 	// Query table details
 	tableQuery := `SELECT table_name, gc_grace_seconds, compaction, compression 
 	               FROM system_schema.tables 
@@ -289,46 +332,30 @@ func (s *Session) DescribeTablesQuery(keyspace string) ([]TableListInfo, error) 
 
 // DBDescribeTable handles version detection and returns appropriate data
 func (s *Session) DBDescribeTable(sessionMgr *session.Manager, tableName string) (interface{}, *TableInfo, error) {
-	// Check if we can use server-side DESCRIBE (Cassandra 4.0+)
+	keyspace, name, err := qualify(sessionMgr, tableName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Cassandra 4.0 and later describe it themselves.
 	if s.IsVersion4OrHigher() {
-		// Try server-side DESCRIBE
-		describeQuery := fmt.Sprintf("DESCRIBE TABLE %s", tableName)
-		
-		iter := s.Query(describeQuery).Iter()
-		
+		iter := s.Query("DESCRIBE TABLE " + quoteQualified(keyspace, name)).Iter()
+
 		// The server returns a result set with columns like 'keyspace_name', 'type', 'name', 'create_statement'
 		result := make(map[string]interface{})
 		if iter.MapScan(result) {
 			_ = iter.Close()
-			
+
 			if createStmt, ok := result["create_statement"]; ok {
 				return fmt.Sprintf("%v", createStmt), nil, nil
 			}
 		}
-		
+
 		_ = iter.Close()
 		// Server-side DESCRIBE returned no results, fall back to manual
 	}
-	
-	// Fall back to manual construction for pre-4.0 or if server-side failed
-	// Check if table name includes keyspace qualification
-	keyspaceName := ""
-	if sessionMgr != nil {
-		keyspaceName = sessionMgr.CurrentKeyspace()
-	}
-	actualTableName := tableName
-	
-	if strings.Contains(tableName, ".") {
-		parts := strings.Split(tableName, ".")
-		if len(parts) == 2 {
-			keyspaceName = parts[0]
-			actualTableName = parts[1]
-		}
-	} else if keyspaceName == "" {
-		return nil, nil, fmt.Errorf("no keyspace selected")
-	}
 
-	tableInfo, err := s.DescribeTableQuery(keyspaceName, actualTableName)
+	tableInfo, err := s.DescribeTableQuery(keyspace, name)
 	if err != nil {
 		return nil, nil, err
 	}

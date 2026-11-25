@@ -1,0 +1,27 @@
+# golangci-lint configuration
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - ineffassign
+    - gosec
+    - misspell
+    - gocritic
+  disable:
+    - errcheck
+  exclusions:
+    rules:
+      # Exclude test files from gosec linter
+      - path: _test\.go
+        linters:
+          - gosec
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

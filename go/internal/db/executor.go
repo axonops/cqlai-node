@@ -4,13 +4,12 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/axonops/cqlai-node/internal/logger"
+	"github.com/axonops/cqlai-node/internal/validation"
 )
 
 // formatUDTMap formats a UDT map for display
@@ -57,7 +56,7 @@ func formatValueInUDT(val interface{}) string {
 	case []byte:
 		return fmt.Sprintf("0x%x", v)
 	case time.Time:
-		return v.Format(time.RFC3339)
+		return v.Format(TimestampLayout)
 	case time.Duration:
 		return v.String()
 	case net.IP:
@@ -159,7 +158,7 @@ func FormatValue(val interface{}) string {
 	case []byte:
 		return fmt.Sprintf("0x%x", v)
 	case time.Time:
-		return v.Format(time.RFC3339)
+		return v.Format(TimestampLayout)
 	case time.Duration:
 		return v.String()
 	case net.IP:
@@ -178,37 +177,24 @@ func FormatValue(val interface{}) string {
 	}
 }
 
-// extractTableName extracts the keyspace and table name from a SELECT query
+// extractTableName is the keyspace and table a SELECT reads, as Cassandra
+// stores the names, with the keyspace empty when the query does not name one.
+//
+// Read by the statement gate's lexer, which knows strings, quoted names and
+// comments. A search for "FROM " found it in the upper-cased, trimmed text and
+// then cut the query itself at that place: leading spaces moved the cut onto
+// the wrong word, and a letter whose upper case is a different length moved
+// it past the end of the query.
 func extractTableName(query string) (keyspace, table string) {
-	// Simple extraction - look for FROM tablename pattern
-	upperQuery := strings.ToUpper(strings.TrimSpace(query))
-	fromIndex := strings.Index(upperQuery, "FROM ")
-	if fromIndex == -1 {
+	s, err := validation.Classify(query)
+	if err != nil || s.Command != "SELECT" || len(s.Names) == 0 {
 		return "", ""
 	}
-
-	// Get the part after FROM
-	afterFrom := strings.TrimSpace(query[fromIndex+5:])
-
-	// Split by whitespace or special characters to get the table name
-	parts := strings.FieldsFunc(afterFrom, func(r rune) bool {
-		return r == ' ' || r == '\t' || r == '\n' || r == ';' || r == '('
-	})
-
-	if len(parts) > 0 {
-		fullName := parts[0]
-		if strings.Contains(fullName, ".") {
-			// Has keyspace prefix
-			tableParts := strings.Split(fullName, ".")
-			if len(tableParts) == 2 {
-				return tableParts[0], tableParts[1]
-			}
-			return "", tableParts[len(tableParts)-1]
-		}
-		return "", fullName
+	name := s.Names[0]
+	if !name.Qualified {
+		return "", name.Table
 	}
-
-	return "", ""
+	return name.Keyspace, name.Table
 }
 
 // getColumnTypeFromSystemTable gets the full type definition for a column from system tables
@@ -276,13 +262,39 @@ func (s *Session) getColumnTypeUsingMetadata(keyspace, table, column string) str
 	return s.getColumnTypeFromSystemTable(keyspace, table, column)
 }
 
-// captureTracer implements gocql.Tracer to capture trace IDs
+// captureTracer implements gocql.Tracer to capture trace IDs.
+//
+// Straight through to the session, on every request. A paged query is one
+// request per page and the driver traces each of them; this kept the id in a
+// field of its own that was copied to the session when the first page came
+// back, so every page after that was traced and thrown away - the TRACE view
+// showed the first page's trace whichever page you were reading.
 type captureTracer struct {
-	traceID []byte
+	session *Session
 }
 
 func (t *captureTracer) Trace(traceID []byte) {
-	t.traceID = traceID
+	t.session.noteTrace(traceID)
+}
+
+// ExecuteCQLQueryWithValues executes a statement with bind parameters.
+//
+// Use this for anything built from data rather than typed by the user: values
+// travel to Cassandra as parameters instead of being pasted into the statement
+// text, so they cannot alter it. It returns the same shapes as ExecuteCQLQuery,
+// an error or a QueryResult, so callers can handle both the same way.
+//
+// This is for statements that do not return rows. SELECTs still go through
+// ExecuteCQLQuery, which routes them to the streaming path.
+func (s *Session) ExecuteCQLQueryWithValues(query string, values ...interface{}) interface{} {
+	if s == nil || s.Session == nil {
+		return fmt.Errorf("not connected to database")
+	}
+
+	if err := s.Query(query, values...).Exec(); err != nil {
+		return err
+	}
+	return QueryResult{}
 }
 
 // ExecuteCQLQuery executes a regular CQL query
@@ -310,7 +322,7 @@ func (s *Session) ExecuteCQLQuery(query string) interface{} {
 			// Use appropriate system table based on Cassandra version
 			var exists string
 			var iter *gocql.Iter
-			
+
 			if s.IsVersion3OrHigher() {
 				// Cassandra 3.0+ uses system_schema.keyspaces
 				iter = s.Query("SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?", keyspace).Iter()
@@ -318,12 +330,16 @@ func (s *Session) ExecuteCQLQuery(query string) interface{} {
 				// Cassandra 2.x uses system.schema_keyspaces
 				iter = s.Query("SELECT keyspace_name FROM system.schema_keyspaces WHERE keyspace_name = ?", keyspace).Iter()
 			}
-			
-			if !iter.Scan(&exists) {
-				_ = iter.Close()
+
+			found := iter.Scan(&exists)
+			_ = iter.Close()
+
+			// system_views is not in system_schema - nothing virtual is - and
+			// USE refused it as a keyspace that did not exist, while a SELECT
+			// from one of its tables worked.
+			if !found && !s.IsVirtualKeyspace(keyspace) {
 				return fmt.Errorf("keyspace '%s' does not exist", keyspace)
 			}
-			_ = iter.Close()
 
 			// Return success - the router/UI will handle updating the current keyspace
 			return fmt.Sprintf("Now using keyspace %s", keyspace)
@@ -368,44 +384,15 @@ func (s *Session) ExecuteSelectQuery(query string) interface{} {
 
 	// Create the query
 	q := s.Query(query)
-	
-	// Enable tracing if needed and capture trace ID
-	var tracer *captureTracer
+
+	// Enable tracing if needed. Every request of this query is traced, the
+	// pages after the first included.
 	if s.tracing {
-		tracer = &captureTracer{}
-		q = q.Trace(tracer)
-		defer func() {
-			// Store the trace ID for later retrieval
-			if tracer != nil && tracer.traceID != nil {
-				s.lastTraceID = tracer.traceID
-			}
-		}()
+		s.startTracing()
+		q = q.Trace(&captureTracer{session: s})
 	}
 
 	iter := q.Iter()
-
-	// Check for connection errors early
-	if err := iter.Close(); err != nil {
-		errStr := err.Error()
-		if strings.Contains(errStr, "connection refused") ||
-			strings.Contains(errStr, "no connections") ||
-			strings.Contains(errStr, "unable to connect") {
-			return fmt.Errorf("connection lost to Cassandra - please check if the server is running")
-		}
-		// Re-create the iterator if no connection error
-		q = s.Query(query)
-		if s.tracing && tracer != nil {
-			q = q.Trace(tracer)
-		}
-		iter = q.Iter()
-	} else {
-		// Re-create the iterator since we closed it
-		q = s.Query(query)
-		if s.tracing && tracer != nil {
-			q = q.Trace(tracer)
-		}
-		iter = q.Iter()
-	}
 
 	// Get column info
 	columns := iter.Columns()
@@ -495,18 +482,7 @@ func (s *Session) ExecuteSelectQuery(query string) interface{} {
 			columnTypes[i] = fullType
 		}
 
-		// Add indicators for key columns
-		if keyInfo, exists := keyColumns[col.Name]; exists {
-			logger.DebugfToFile("executeSelectQuery", "Adding indicator for %s: %s", col.Name, keyInfo.Kind)
-			switch keyInfo.Kind {
-			case "partition_key":
-				headers[i] += " (PK)"
-			case "clustering":
-				headers[i] += " (C)"
-			}
-		} else {
-			logger.DebugfToFile("executeSelectQuery", "No key info for column %s", col.Name)
-		}
+		headers[i] += keyColumns.Marker(col.Name)
 	}
 
 	// Collect results - use MapScan for better type handling
@@ -514,7 +490,6 @@ func (s *Session) ExecuteSelectQuery(query string) interface{} {
 	rawData := make([]map[string]interface{}, 0)
 
 	logger.DebugToFile("executeSelectQuery", "Starting row scan with MapScan...")
-	rowNum := 0
 
 	// Extract clean column names (without PK/C indicators)
 	cleanHeaders := make([]string, len(filteredColumns))
@@ -522,196 +497,38 @@ func (s *Session) ExecuteSelectQuery(query string) interface{} {
 		cleanHeaders[i] = col.Name
 	}
 
-	// Use MapScan for all tables to safely handle NULL values
-	// gocql can panic when scanning NULLs into interface{} with regular Scan()
-	// MapScan handles NULLs gracefully by omitting them from the map
-	if true {  // Always use MapScan for safety
-		virtualResults := make([][]string, 0)
-		for {
-			rowMap := make(map[string]interface{})
-			if !iter.MapScan(rowMap) {
-				break
-			}
-
-			// Convert map to row array in column order
-			row := make([]string, len(filteredColumns))
-			rawRow := make(map[string]interface{})
-
-			for i, col := range filteredColumns {
-				val, exists := rowMap[col.Name]
-				if !exists {
-					val = nil
-				}
-				rawRow[col.Name] = val
-				row[i] = FormatValue(val)
-			}
-
-			virtualResults = append(virtualResults, row)
-			rawData = append(rawData, rawRow)
-		}
-		results = append(results, virtualResults...)
-	} else {
-		// Use Scan with interface{} slice for regular tables to get raw bytes for UDTs
-		// MapScan returns empty maps for UDTs, but we need to use RawBytes for UDT columns
-		for {
-			// Create a slice to scan into - use RawBytes for UDT columns
-			scanDest := make([]interface{}, len(filteredColumns))
-			for i, col := range filteredColumns {
-				// Handle nil TypeInfo (can happen with virtual tables)
-				if col.TypeInfo == nil {
-					scanDest[i] = new(interface{})
-					continue
-				}
-
-				// Use defer/recover to catch any panic from Type() call
-				// TypeInfo might be non-nil but internally invalid
-				func(idx int) {
-					defer func() {
-						if r := recover(); r != nil {
-							// TypeInfo is invalid, treat as regular column
-							scanDest[idx] = new(interface{})
-						}
-					}()
-
-					switch col.TypeInfo.Type() {
-					case gocql.TypeUDT:
-						// Use map[string]interface{} for UDT columns
-						// Note: gocql doesn't populate UDTs properly when scanning into interface{}
-						// but it does work when scanning into *map[string]interface{}
-						scanDest[idx] = new(map[string]interface{})
-					default:
-						scanDest[idx] = new(interface{})
-					}
-				}(i)
-			}
-
-		// Scan the row
-		if !iter.Scan(scanDest...) {
-			logger.DebugToFile("executeSelectQuery", "Scan returned false - no more rows or error")
+	// MapScan for every table: scanning a NULL into an interface{} with Scan
+	// panics, and MapScan leaves the key out of the map instead.
+	scanned := make([][]string, 0)
+	for {
+		rowMap := make(map[string]interface{})
+		if !ScanRow(iter, rowMap) {
 			break
 		}
 
-		// Store raw data for JSON export (preserves types)
-		rawRow := make(map[string]interface{})
-		// Create formatted row for display
+		// Convert map to row array in column order
 		row := make([]string, len(filteredColumns))
+		rawRow := make(map[string]interface{})
 
 		for i, col := range filteredColumns {
-			// Extract value based on type
-			var val interface{}
-			switch {
-			case col.TypeInfo == nil:
-				// Handle nil TypeInfo (virtual tables)
-				val = *(scanDest[i].(*interface{}))
-			case col.TypeInfo.Type() == gocql.TypeUDT:
-				// For UDT columns, we used *map[string]interface{}
-				udtMap := scanDest[i].(*map[string]interface{})
-				if udtMap != nil && *udtMap != nil {
-					val = *udtMap
-				} else {
-					val = nil
-				}
-			default:
-				// Regular column - dereference the pointer
-				val = *(scanDest[i].(*interface{}))
+			val, exists := rowMap[col.Name]
+			if !exists {
+				val = nil
 			}
-
-			if val == nil {
-				rawRow[cleanHeaders[i]] = nil
-				row[i] = "null"
-			} else {
-				// Special handling for UDTs and complex types
-				typeStr := columnTypes[i]
-
-				// Parse the type string to get structured type information
-				typeInfo, parseErr := ParseCQLType(typeStr)
-
-				// Add debug logging to understand what we're getting
-				logger.DebugfToFile("ExecuteSelectQuery", "Column %s: typeStr=%s, gocqlType=%v, parsedType=%v, parseErr=%v, valType=%T",
-					col.Name, typeStr, col.TypeInfo.Type(), typeInfo, parseErr, val)
-
-				// Determine the data type category
-				isUDT := col.TypeInfo.Type() == gocql.TypeUDT || (typeInfo != nil && typeInfo.BaseType == "udt")
-				isCollection := typeInfo != nil && (typeInfo.BaseType == "list" || typeInfo.BaseType == "set" ||
-					typeInfo.BaseType == "map" || typeInfo.BaseType == "tuple")
-
-				switch {
-				case isUDT:
-					// UDT handling - try to decode if we got raw bytes
-					if bytes, ok := val.([]byte); ok && len(bytes) > 0 {
-						logger.DebugfToFile("ExecuteSelectQuery", "UDT %s came as bytes: %d bytes", col.Name, len(bytes))
-
-						// Use our binary decoder to decode the UDT
-						decoder := NewBinaryDecoder(s.udtRegistry)
-
-						// Determine the keyspace - prefer query keyspace, then current
-						keyspace := currentKeyspace
-						if keyspace == "" {
-							keyspace = s.Keyspace()
-							if keyspace == "" && s.cluster != nil {
-								keyspace = s.cluster.Keyspace
-							}
-						}
-
-						// Try to decode the UDT
-						if typeInfo != nil {
-							decoded, err := decoder.Decode(bytes, typeInfo, keyspace)
-							if err != nil {
-								logger.DebugfToFile("ExecuteSelectQuery", "Failed to decode UDT %s: %v", col.Name, err)
-								// Fall back to showing raw bytes info
-								rawRow[cleanHeaders[i]] = map[string]interface{}{"_raw_bytes": fmt.Sprintf("%x", bytes)}
-								row[i] = fmt.Sprintf("{_raw_bytes:%d}", len(bytes))
-							} else {
-								// Successfully decoded UDT
-								rawRow[cleanHeaders[i]] = decoded
-								// Format for display
-								if m, ok := decoded.(map[string]interface{}); ok {
-									row[i] = formatUDTMap(m)
-								} else {
-									row[i] = fmt.Sprintf("%v", decoded)
-								}
-							}
-						} else {
-							// Couldn't parse type, show raw bytes
-							rawRow[cleanHeaders[i]] = map[string]interface{}{"_raw_bytes": fmt.Sprintf("%x", bytes)}
-							row[i] = fmt.Sprintf("{_raw_bytes:%d}", len(bytes))
-						}
-					} else if m, ok := val.(map[string]interface{}); ok {
-						// Sometimes gocql returns a map directly
-						if len(m) > 0 {
-							rawRow[cleanHeaders[i]] = m
-							row[i] = formatUDTMap(m)
-						} else {
-							// Empty map - common issue with gocql and UDTs
-							logger.DebugfToFile("ExecuteSelectQuery", "UDT %s returned empty map", col.Name)
-							rawRow[cleanHeaders[i]] = m
-							row[i] = "{}"
-						}
-					} else {
-						// Other format - just display as is
-						rawRow[cleanHeaders[i]] = val
-						row[i] = fmt.Sprintf("%v", val)
-					}
-
-				case isCollection:
-					// Collections are already decoded by gocql, just format them
-					rawRow[cleanHeaders[i]] = val
-					row[i] = FormatValue(val)
-
-				default:
-					// Store the actual value for JSON
-					rawRow[cleanHeaders[i]] = val
-
-					// Format for display - use formatValue which handles collections properly
-					row[i] = FormatValue(val)
-				}
-			}
+			rawRow[col.Name] = val
+			row[i] = FormatValue(val)
 		}
+
+		scanned = append(scanned, row)
 		rawData = append(rawData, rawRow)
-		results = append(results, row)
-		rowNum++
 	}
-	}
+	results = append(results, scanned...)
+
+	// Count what was collected. This used to be a counter incremented beside
+	// the append, in the other half of an "if true ... else": the rows came
+	// back from the half that runs and the count from the half that cannot, so
+	// every non-streaming SELECT reported no rows however many it returned.
+	rowNum := len(scanned)
 	logger.DebugfToFile("executeSelectQuery", "Scan completed. Total rows: %d", rowNum)
 
 	if err := iter.Close(); err != nil {
@@ -741,20 +558,21 @@ func (s *Session) ExecuteSelectQuery(query string) interface{} {
 // shouldUseStreaming determines if a query should use streaming based on heuristics
 func (s *Session) shouldUseStreaming(query string) bool {
 	// Always use streaming unless there's a small LIMIT
-	upperQuery := strings.ToUpper(strings.TrimSpace(query))
-
-	// Check for LIMIT clause
-	if strings.Contains(upperQuery, " LIMIT ") {
-		// Extract limit value - simple regex for "LIMIT n"
-		re := regexp.MustCompile(`LIMIT\s+(\d+)`)
-		matches := re.FindStringSubmatch(upperQuery)
-		if len(matches) > 1 {
-			limit, err := strconv.Atoi(matches[1])
-			if err == nil && limit <= 1000 {
-				// Small limit, don't use streaming
-				logger.DebugfToFile("shouldUseStreaming", "Query has LIMIT %d, not using streaming", limit)
-				return false
-			}
+	// A LIMIT small enough to fit in one page has nothing to page through, so
+	// fetch it in one go.
+	//
+	// This used to compare the limit against a hardcoded 1000, which had no
+	// relationship to the page size: PAGING 100 with LIMIT 300 fetched all 300
+	// at once and PAGING was ignored. Measuring against the page size is what
+	// makes PAGING mean something.
+	//
+	// The LIMIT is read by the statement gate's lexer. A pattern for LIMIT n
+	// also matched PER PARTITION LIMIT 1, which bounds each partition, not
+	// the result: the whole table was then read into memory in one go.
+	if pageSize := s.PageSize(); pageSize > 0 {
+		if limit, ok := validation.Limit(query); ok && limit <= pageSize {
+			logger.DebugfToFile("shouldUseStreaming", "LIMIT %d fits in a page of %d, not using streaming", limit, pageSize)
+			return false
 		}
 	}
 
@@ -775,20 +593,14 @@ func (s *Session) ExecuteStreamingQuery(query string) interface{} {
 	if s.pageSize > 0 {
 		q.PageSize(s.pageSize)
 	}
-	
-	// Enable tracing if needed and capture trace ID
-	var tracer *captureTracer
+
+	// Enable tracing if needed. Every request of this query is traced, the
+	// pages after the first included.
 	if s.tracing {
-		tracer = &captureTracer{}
-		q = q.Trace(tracer)
-		defer func() {
-			// Store the trace ID for later retrieval
-			if tracer != nil && tracer.traceID != nil {
-				s.lastTraceID = tracer.traceID
-			}
-		}()
+		s.startTracing()
+		q = q.Trace(&captureTracer{session: s})
 	}
-	
+
 	iter := q.Iter()
 
 	// Get column info
@@ -830,49 +642,14 @@ func (s *Session) ExecuteStreamingQuery(query string) interface{} {
 	columnTypes := make([]string, len(filteredColumns))
 	columnTypeInfos := make([]gocql.TypeInfo, len(filteredColumns))
 
-	// For UDT columns, we need to get the full type definition from system tables
-	queryKeyspace, tableName := extractTableName(query)
-	currentKeyspace := queryKeyspace
-	if currentKeyspace == "" {
-		currentKeyspace = s.Keyspace()
-	}
-
+	types, currentKeyspace := s.columnTypesOf(query, filteredColumns)
 	for i, col := range filteredColumns {
 		columnNames[i] = col.Name // Store original name
-		headers[i] = col.Name     // Start with original name
+		headers[i] = col.Name + keyColumns.Marker(col.Name)
 
 		// Store the TypeInfo for proper type handling (especially UDTs)
 		columnTypeInfos[i] = col.TypeInfo
-
-		// Store the column type - use formatTypeInfo to get full type info including collection element types
-		if col.TypeInfo == nil {
-			columnTypes[i] = "unknown"
-		} else {
-			// Use formatTypeInfo for all columns to get proper type with element types
-			fullType := formatTypeInfo(col.TypeInfo)
-
-			// For UDTs, we might need additional metadata
-			if col.TypeInfo.Type() == gocql.TypeUDT && currentKeyspace != "" && tableName != "" {
-				// Try to get the UDT name from metadata if formatTypeInfo didn't get it
-				if fullType == "udt" || fullType == "" {
-					udtType := s.getColumnTypeUsingMetadata(currentKeyspace, tableName, col.Name)
-					if udtType != "" {
-						fullType = udtType
-					}
-				}
-			}
-			columnTypes[i] = fullType
-		}
-
-		// Add indicators for key columns
-		if keyInfo, exists := keyColumns[col.Name]; exists {
-			switch keyInfo.Kind {
-			case "partition_key":
-				headers[i] += " (PK)"
-			case "clustering":
-				headers[i] += " (C)"
-			}
-		}
+		columnTypes[i] = types[i]
 	}
 
 	// Return streaming result with iterator
@@ -887,42 +664,14 @@ func (s *Session) ExecuteStreamingQuery(query string) interface{} {
 	}
 }
 
-// ConvertToJSONQuery converts a SELECT query to SELECT JSON format
-// This is now a public method so it can be called from the router/UI layer when needed
-func ConvertToJSONQuery(query string) string {
-	upperQuery := strings.ToUpper(strings.TrimSpace(query))
-
-	// Check if it's already a JSON query
-	if strings.Contains(upperQuery, "SELECT JSON") || strings.Contains(upperQuery, "SELECT DISTINCT JSON") {
-		return query
-	}
-
-	// Only convert SELECT queries
-	if !strings.HasPrefix(upperQuery, "SELECT") {
-		return query
-	}
-
-	// Handle SELECT DISTINCT
-	if strings.HasPrefix(upperQuery, "SELECT DISTINCT") {
-		// Replace "SELECT DISTINCT" with "SELECT DISTINCT JSON"
-		re := regexp.MustCompile(`(?i)^SELECT\s+DISTINCT\s+`)
-		return re.ReplaceAllString(query, "SELECT DISTINCT JSON ")
-	}
-
-	// Handle regular SELECT
-	// Replace "SELECT" with "SELECT JSON"
-	re := regexp.MustCompile(`(?i)^SELECT\s+`)
-	return re.ReplaceAllString(query, "SELECT JSON ")
-}
-
 // GetKeyColumns returns information about partition and clustering columns for a table
-func (s *Session) GetKeyColumns(query string) map[string]KeyColumnInfo {
-	keyColumns := make(map[string]KeyColumnInfo)
+func (s *Session) GetKeyColumns(query string) KeyColumns {
+	keyColumns := make(KeyColumns)
 
 	// Try to extract table name from the SELECT query
-	// Handle patterns like: SELECT ... FROM keyspace.table or FROM table
-	re := regexp.MustCompile(`(?i)FROM\s+(?:([a-zA-Z_][a-zA-Z0-9_]*)\.)?([a-zA-Z_][a-zA-Z0-9_]*)`)
-	matches := re.FindStringSubmatch(query)
+	// Handle patterns like: SELECT ... FROM keyspace.table or FROM table,
+	// with either part quoted.
+	matches := fromClause.FindStringSubmatch(query)
 
 	logger.DebugfToFile("getKeyColumns", "Query: %s", query)
 	logger.DebugfToFile("getKeyColumns", "Regex matches: %v", matches)
@@ -932,13 +681,17 @@ func (s *Session) GetKeyColumns(query string) map[string]KeyColumnInfo {
 		return keyColumns
 	}
 
-	keyspaceName := matches[1] // May be empty
-	tableName := matches[2]
+	keyspaceName := cqlIdentifier(matches[1]) // May be empty
+	tableName := cqlIdentifier(matches[2])
 
-	// If no keyspace specified, we can't determine key columns
-	// The UI/router layer should track the current keyspace
+	// An unqualified query means the keyspace the session is on, which is what
+	// USE sets. Giving up here is why the markers only ever appeared when the
+	// query happened to name the keyspace.
 	if keyspaceName == "" {
-		logger.DebugToFile("getKeyColumns", "No keyspace specified")
+		keyspaceName = s.Keyspace()
+	}
+	if keyspaceName == "" {
+		logger.DebugToFile("getKeyColumns", "No keyspace in the query and none set on the session")
 		return keyColumns
 	}
 
@@ -967,4 +720,33 @@ func (s *Session) GetKeyColumns(query string) map[string]KeyColumnInfo {
 	}
 
 	return keyColumns
+}
+
+// columnTypesOf is the CQL type of each column a query returns, with element
+// types for collections, and the keyspace the query is in.
+//
+// A user-defined type comes back from the driver as "udt" alone; the name is
+// looked up in the table's metadata, which is what decoding it needs.
+func (s *Session) columnTypesOf(query string, columns []gocql.ColumnInfo) ([]string, string) {
+	queryKeyspace, tableName := extractTableName(query)
+	keyspace := queryKeyspace
+	if keyspace == "" {
+		keyspace = s.Keyspace()
+	}
+
+	types := make([]string, len(columns))
+	for i, col := range columns {
+		if col.TypeInfo == nil {
+			types[i] = "unknown"
+			continue
+		}
+		fullType := formatTypeInfo(col.TypeInfo)
+		if col.TypeInfo.Type() == gocql.TypeUDT && keyspace != "" && tableName != "" && (fullType == "udt" || fullType == "") {
+			if udtType := s.getColumnTypeUsingMetadata(keyspace, tableName, col.Name); udtType != "" {
+				fullType = udtType
+			}
+		}
+		types[i] = fullType
+	}
+	return types, keyspace
 }

@@ -8,29 +8,110 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	
+
 	"github.com/axonops/cqlai-node/internal/logger"
 )
 
 // Config holds the application configuration
 type Config struct {
-	Host                string          `json:"host"`
-	Port                int             `json:"port"`
-	Keyspace            string          `json:"keyspace"`
-	Username            string          `json:"username"`
-	Password            string          `json:"password"`
-	RequireConfirmation bool            `json:"requireConfirmation,omitempty"`
-	Consistency         string          `json:"consistency,omitempty"`         // Default consistency level (e.g., "LOCAL_ONE", "QUORUM")
-	PageSize            int             `json:"pageSize,omitempty"`
-	MaxMemoryMB         int             `json:"maxMemoryMB,omitempty"`         // Max memory for results in MB (default: 10)
-	ConnectTimeout      int             `json:"connectTimeout,omitempty"`      // Connection timeout in seconds
-	RequestTimeout      int             `json:"requestTimeout,omitempty"`      // Request timeout in seconds
-	Debug               bool            `json:"debug,omitempty"`               // Enable debug logging
-	HistoryFile         string          `json:"historyFile,omitempty"`         // Path to CQL command history file
-	AIHistoryFile       string          `json:"aiHistoryFile,omitempty"`       // Path to AI command history file
-	SSL                 *SSLConfig      `json:"ssl,omitempty"`
-	AI                  *AIConfig       `json:"ai,omitempty"`
-	AuthProvider        *AuthProvider   `json:"authProvider,omitempty"`
+	// These five carry omitempty like the rest of the file so that writing the
+	// configuration back - which the PREFERENCES window does - does not add
+	// "keyspace": "" and "password": "" to a file that never had them. Reading
+	// is unaffected: a key that is not there leaves the default in place, which
+	// is what an empty value meant anyway.
+	Host                string     `json:"host,omitempty"`
+	Port                int        `json:"port,omitempty"`
+	Keyspace            string     `json:"keyspace,omitempty"`
+	Username            string     `json:"username,omitempty"`
+	Password            string     `json:"password,omitempty"`
+	VaultPath           string     `json:"vaultPath,omitempty"` // Read the username and password from this Vault/OpenBao path
+	RequireConfirmation bool       `json:"requireConfirmation,omitempty"`
+	Consistency         string     `json:"consistency,omitempty"` // Default consistency level (e.g., "LOCAL_ONE", "QUORUM")
+	PageSize            int        `json:"pageSize,omitempty"`
+	MaxMemoryMB         int        `json:"maxMemoryMB,omitempty"`    // Max memory for results in MB (default: 10)
+	ConnectTimeout      int        `json:"connectTimeout,omitempty"` // Connection timeout in seconds
+	RequestTimeout      int        `json:"requestTimeout,omitempty"` // Request timeout in seconds
+	Debug               bool       `json:"debug,omitempty"`          // Enable debug logging
+	HistoryFile         string     `json:"historyFile,omitempty"`    // Path to CQL command history file
+	AIHistoryFile       string     `json:"aiHistoryFile,omitempty"`  // Path to AI command history file
+	OutputFormat        string     `json:"outputFormat,omitempty"`   // Default output format (TABLE, ASCII, EXPAND, JSON)
+	SSL                 *SSLConfig `json:"ssl,omitempty"`
+
+	// Name is what this connection is called in the CONNECT window, and
+	// Connections are the ones it has been told to keep. A saved connection is
+	// a configuration of its own with only the connection settings filled in,
+	// so the window edits one the same way it edits the file.
+	Name        string   `json:"name,omitempty"`
+	Connections []Config `json:"connections,omitempty"`
+
+	// OTel turns on OpenTelemetry spans for the CQL run. It is read from the
+	// top of the file only.
+	OTel *OTelConfig `json:"otel,omitempty"`
+
+	AI           *AIConfig     `json:"ai,omitempty"`
+	AuthProvider *AuthProvider `json:"authProvider,omitempty"`
+
+	// MCP is what the MCP server may do. At the top of the file it is the
+	// most any connection may do; on a saved connection it can only narrow
+	// that.
+	MCP          *MCPConfig `json:"mcp,omitempty"`
+	LoadWarnings []string   `json:"-"` // Warnings from loading config files (not serialized)
+
+	// SourcePath is the JSON file this config was read from, empty when none of
+	// the candidate paths existed. The PREFERENCES window writes back to it, so
+	// editing a setting lands in the file the settings came from rather than in
+	// a new one somewhere else.
+	SourcePath string `json:"-"`
+}
+
+// OTelConfig is the OpenTelemetry tracing setting. Where the spans go is set
+// with the standard OTEL_* environment variables.
+type OTelConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+// MCPConfig is what the MCP server may do: the policy as the file holds it.
+//
+// Every zero value is the safe one, because a setting the file leaves out reads
+// as zero: AllowScans is off, the limits fall back to their
+// defaults, and Permit falls back to the read commands.
+type MCPConfig struct {
+	// Permit is the CQL commands the model may run. Nil - the key left out -
+	// is the default, the read commands. An empty list is nothing at all, which
+	// is why it is a pointer: the two have to stay apart in the file.
+	Permit *[]string `json:"permit,omitempty"`
+
+	Keyspaces []string `json:"keyspaces,omitempty"` // the visible keyspaces; empty is all but the system ones
+	// SystemKeyspaces makes the system keyspaces visible too when every
+	// keyspace is. system_auth's data stays hidden whatever this says.
+	SystemKeyspaces bool     `json:"systemKeyspaces,omitempty"`
+	Deny            []string `json:"deny,omitempty"`   // keyspaces or keyspace.table never visible
+	Redact          []string `json:"redact,omitempty"` // keyspace.table.column, with * for any part
+
+	AllowScans bool `json:"allowScans,omitempty"`
+	// AutoFetch makes a query return every row, paging through them itself,
+	// rather than one page and a token for the next.
+	AutoFetch bool `json:"autoFetch,omitempty"`
+	// MaxRows is the page size: the rows a query returns at a time, unless
+	// the client asks for another number.
+	MaxRows           int `json:"maxRows,omitempty"`
+	MaxValueBytes     int `json:"maxValueBytes,omitempty"`
+	MaxCallsPerMinute int `json:"maxCallsPerMinute,omitempty"`
+
+	// Server-wide: these are read from the top of the file only.
+	AuditLog string `json:"auditLog,omitempty"`
+	Port     int    `json:"port,omitempty"` // where the terminal app serves MCP
+
+	// How the terminal app serves MCP over HTTP. Listen is the address, and
+	// 127.0.0.1 unless set. Token makes every request carry the token kept in
+	// ~/.cassandra/cqlai_mcp_token. TLSCert and TLSKey serve HTTPS, and
+	// TLSClientCA asks each client for a certificate that CA signed. Another
+	// address than this machine's own needs TLS, and the token or a client CA.
+	Listen      string `json:"listen,omitempty"`
+	Token       bool   `json:"token,omitempty"`
+	TLSCert     string `json:"tlsCert,omitempty"`
+	TLSKey      string `json:"tlsKey,omitempty"`
+	TLSClientCA string `json:"tlsClientCA,omitempty"`
 }
 
 // AuthProvider holds authentication provider configuration
@@ -53,9 +134,9 @@ type SSLConfig struct {
 
 // AIConfig holds AI provider configuration
 type AIConfig struct {
-	Provider   string            `json:"provider"` // "mock", "openai", "anthropic", "gemini", "ollama", "openrouter"
-	APIKey     string            `json:"apiKey"`   // General API key (overridden by provider-specific)
-	Model      string            `json:"model"`    // General model (overridden by provider-specific)
+	Provider   string            `json:"provider"`      // "mock", "openai", "anthropic", "gemini", "ollama", "openrouter"
+	APIKey     string            `json:"apiKey"`        // General API key (overridden by provider-specific)
+	Model      string            `json:"model"`         // General model (overridden by provider-specific)
 	URL        string            `json:"url,omitempty"` // General URL (overridden by provider-specific)
 	OpenAI     *AIProviderConfig `json:"openai,omitempty"`
 	Anthropic  *AIProviderConfig `json:"anthropic,omitempty"`
@@ -81,6 +162,31 @@ const (
 	OutputFormatJSON   OutputFormat = "JSON"
 )
 
+// ConfigPaths are the files cqlai reads its configuration from, in the order it
+// looks for them.
+//
+// The first is the working directory, which is a configuration for whatever is
+// being worked on rather than for the person. The rest are the person's, and
+// the one that counts is beside cqlshrc: cqlai already reads that file out of
+// ~/.cassandra, and keeping its own next to it is one directory to find rather
+// than two. The two after it are where the file used to go, and are still read
+// so that upgrading changes nothing.
+func ConfigPaths() []string {
+	home := os.Getenv("HOME")
+
+	return []string{
+		"cqlai.json",
+		filepath.Join(home, ".cassandra", "cqlai.json"),
+		filepath.Join(home, ".cqlai.json"),
+		filepath.Join(home, ".config", "cqlai", "config.json"),
+	}
+}
+
+// DefaultConfigPath is where a configuration that came from nowhere is written.
+func DefaultConfigPath() string {
+	return filepath.Join(os.Getenv("HOME"), ".cassandra", "cqlai.json")
+}
+
 // LoadConfig loads configuration from file and environment variables
 // If customConfigPath is provided and not empty, it will be used instead of default locations
 func LoadConfig(customConfigPath ...string) (*Config, error) {
@@ -90,29 +196,55 @@ func LoadConfig(customConfigPath ...string) (*Config, error) {
 		Host:        "localhost",
 		Port:        9042,
 		MaxMemoryMB: 10, // Default to 10MB if not specified
+		// Asked before DROP, TRUNCATE and DELETE unless the file says
+		// "requireConfirmation": false. A file without the key - most of
+		// them - left it off, though it is documented as on.
+		RequireConfirmation: true,
 	}
 
 	logger.DebugfToFile("Config", "Default config initialized: host=%s, port=%d", config.Host, config.Port)
 
 	// First, try to load CQLSHRC file
-	cqlshrcPaths := []string{
-		filepath.Join(os.Getenv("HOME"), ".cassandra", "cqlshrc"),
-		filepath.Join(os.Getenv("HOME"), ".cqlshrc"),
+	// Check $CQLSH_RC environment variable first (as documented in README)
+	var cqlshrcPaths []string
+	if cqlshRC := os.Getenv("CQLSH_RC"); cqlshRC != "" {
+		cqlshrcPaths = []string{cqlshRC}
+		logger.DebugfToFile("Config", "Using $CQLSH_RC path: %s", cqlshRC)
+	} else {
+		cqlshrcPaths = []string{
+			filepath.Join(os.Getenv("HOME"), ".cassandra", "cqlshrc"),
+			filepath.Join(os.Getenv("HOME"), ".cqlshrc"),
+		}
 	}
 
 	logger.DebugfToFile("Config", "Looking for cqlshrc files in: %v", cqlshrcPaths)
 
+	var cqlshrcWarnings []string
 	for _, path := range cqlshrcPaths {
 		logger.DebugfToFile("Config", "Attempting to load cqlshrc from: %s", path)
-		if err := loadCQLSHRC(path, config); err == nil {
+		err := loadCQLSHRC(path, config)
+		switch {
+		case err == nil:
 			logger.DebugfToFile("Config", "Successfully loaded cqlshrc from: %s", path)
 			logger.DebugfToFile("Config", "Config after cqlshrc: host=%s, port=%d, username=%s, keyspace=%s",
 				config.Host, config.Port, config.Username, config.Keyspace)
+		case os.IsNotExist(err):
+			logger.DebugfToFile("Config", "cqlshrc not found at %s", path)
+		case os.IsPermission(err):
+			warning := fmt.Sprintf("Warning: Cannot read cqlshrc at %s: permission denied", path)
+			cqlshrcWarnings = append(cqlshrcWarnings, warning)
+			logger.DebugfToFile("Config", "Permission denied reading cqlshrc: %s", path)
+		default:
+			warning := fmt.Sprintf("Warning: Error loading cqlshrc from %s: %v", path, err)
+			cqlshrcWarnings = append(cqlshrcWarnings, warning)
+			logger.DebugfToFile("Config", "Error loading cqlshrc from %s: %v", path, err)
+		}
+		if err == nil {
 			break
-		} else {
-			logger.DebugfToFile("Config", "Failed to load cqlshrc from %s: %v", path, err)
 		}
 	}
+	// Store warnings in config for caller to handle
+	config.LoadWarnings = cqlshrcWarnings
 
 	// Then check JSON config file locations (these will override CQLSHRC settings)
 	var configPaths []string
@@ -122,12 +254,7 @@ func LoadConfig(customConfigPath ...string) (*Config, error) {
 		configPaths = []string{customConfigPath[0]}
 		logger.DebugfToFile("Config", "Using custom config path: %s", customConfigPath[0])
 	} else {
-		// Use default locations
-		configPaths = []string{
-			"cqlai.json",
-			filepath.Join(os.Getenv("HOME"), ".cqlai.json"),
-			filepath.Join(os.Getenv("HOME"), ".config", "cqlai", "config.json"),
-		}
+		configPaths = ConfigPaths()
 		logger.DebugfToFile("Config", "Looking for JSON config files in: %v", configPaths)
 	}
 
@@ -137,7 +264,7 @@ func LoadConfig(customConfigPath ...string) (*Config, error) {
 
 	for _, path := range configPaths {
 		logger.DebugfToFile("Config", "Checking JSON config at: %s", path)
-		configData, err = os.ReadFile(path) // #nosec G304 - Config file path is validated
+		configData, err = os.ReadFile(path) // #nosec G304 G703 - Config file path is validated
 		if err == nil {
 			foundPath = path
 			logger.DebugfToFile("Config", "Found JSON config at: %s", path)
@@ -153,12 +280,23 @@ func LoadConfig(customConfigPath ...string) (*Config, error) {
 	}
 
 	if foundPath != "" {
+		config.SourcePath = foundPath
 		if err := json.Unmarshal(configData, config); err != nil {
 			logger.DebugfToFile("Config", "Failed to parse JSON config %s: %v", foundPath, err)
 			return nil, fmt.Errorf("error parsing config file %s: %w", foundPath, err)
 		}
 		logger.DebugfToFile("Config", "Config after JSON: host=%s, port=%d, username=%s, keyspace=%s",
 			config.Host, config.Port, config.Username, config.Keyspace)
+
+		// The connections the file keeps are what it connects to, and the
+		// first of them is the default. The settings at the top level are the
+		// same thing said twice; they are written to keep older builds - and
+		// anything reading the file by hand - working, and the list decides.
+		if standard, kept := config.DefaultConnection(); kept {
+			config.UseConnection(standard)
+			logger.DebugfToFile("Config", "Default connection %s: host=%s, port=%d",
+				ConnectionName(standard), config.Host, config.Port)
+		}
 	}
 
 	// Override with environment variables
@@ -211,6 +349,10 @@ func OverrideWithEnvVars(config *Config) {
 	}
 	if password := os.Getenv("CQLAI_PASSWORD"); password != "" {
 		config.Password = password
+	}
+
+	if vaultPath := os.Getenv("CQLAI_VAULT_PATH"); vaultPath != "" {
+		config.VaultPath = vaultPath
 	}
 
 	// Page size setting
@@ -374,33 +516,49 @@ func OverrideWithEnvVars(config *Config) {
 	}
 }
 
+// outputFormats are the formats OUTPUT accepts, in the order to offer them.
+var outputFormats = []OutputFormat{
+	OutputFormatTable,
+	OutputFormatASCII,
+	OutputFormatExpand,
+	OutputFormatJSON,
+}
+
+// OutputFormats names every format ParseOutputFormat accepts.
+//
+// Anything that offers a choice of format, or lists the valid ones in an error,
+// reads this rather than writing the four out again - the consistency levels
+// were spelled out in five places and had drifted in three of them.
+func OutputFormats() []string {
+	names := make([]string, 0, len(outputFormats))
+	for _, f := range outputFormats {
+		names = append(names, string(f))
+	}
+	return names
+}
+
 // ParseOutputFormat converts a string to OutputFormat
 func ParseOutputFormat(format string) (OutputFormat, error) {
-	switch strings.ToUpper(format) {
-	case "TABLE":
-		return OutputFormatTable, nil
-	case "ASCII":
-		return OutputFormatASCII, nil
-	case "EXPAND":
-		return OutputFormatExpand, nil
-	case "JSON":
-		return OutputFormatJSON, nil
-	default:
-		return "", fmt.Errorf("unknown output format: %s", format)
+	want := strings.ToUpper(format)
+	for _, f := range outputFormats {
+		if string(f) == want {
+			return f, nil
+		}
 	}
+	return "", fmt.Errorf("unknown output format: %s", format)
 }
 
 // loadCQLSHRC loads configuration from a CQLSHRC file
 func loadCQLSHRC(path string, config *Config) error {
 	logger.DebugfToFile("CQLSHRC", "Attempting to open file: %s", path)
-	
-	file, err := os.Open(path) // #nosec G304 - Config file path is validated
+
+	file, err := os.Open(path) // #nosec G304 G703 - Config file path is validated
 	if err != nil {
 		logger.DebugfToFile("CQLSHRC", "Failed to open file %s: %v", path, err)
 		return err
 	}
 	defer file.Close()
-	
+
 	logger.DebugfToFile("CQLSHRC", "Successfully opened file: %s", path)
 
 	scanner := bufio.NewScanner(file)
@@ -411,7 +569,7 @@ func loadCQLSHRC(path string, config *Config) error {
 	for scanner.Scan() {
 		lineNum++
 		line := strings.TrimSpace(scanner.Text())
-		
+
 		// Log non-empty, non-comment lines
 		if line != "" && !strings.HasPrefix(line, ";") && !strings.HasPrefix(line, "#") {
 			logger.DebugfToFile("CQLSHRC", "Line %d: %s", lineNum, line)
@@ -432,7 +590,7 @@ func loadCQLSHRC(path string, config *Config) error {
 		// Parse key-value pairs
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
-			logger.DebugfToFile("CQLSHRC", "Skipping invalid line %d (no '=' found): %s", lineNum, line)
+			logger.DebugfToFile("CQLSHRC", "Skipping invalid line %d (no '=' found)", lineNum)
 			continue
 		}
 
@@ -444,8 +602,13 @@ func loadCQLSHRC(path string, config *Config) error {
 			(value[0] == '\'' && value[len(value)-1] == '\'')) {
 			value = value[1 : len(value)-1]
 		}
-		
-		logger.DebugfToFile("CQLSHRC", "Section [%s], key=%s, value=%s", currentSection, key, value)
+
+		// Mask sensitive values in debug logs
+		logValue := value
+		if strings.ToLower(key) == "password" || strings.Contains(strings.ToLower(key), "api") || strings.Contains(strings.ToLower(key), "secret") {
+			logValue = "(hidden)"
+		}
+		logger.DebugfToFile("CQLSHRC", "Section [%s], key=%s, value=%s", currentSection, key, logValue)
 
 		// Map CQLSHRC values to config
 		switch currentSection {
@@ -462,7 +625,7 @@ func loadCQLSHRC(path string, config *Config) error {
 					logger.DebugfToFile("CQLSHRC", "Failed to parse port value: %s", value)
 				}
 			case "ssl":
-				if value == "true" || value == "1" {
+				if strings.ToLower(value) == "true" || value == "1" {
 					if config.SSL == nil {
 						config.SSL = &SSLConfig{}
 					}
@@ -533,7 +696,7 @@ func loadCQLSHRC(path string, config *Config) error {
 				config.SSL.CertPath = value
 				logger.DebugfToFile("CQLSHRC", "Set cert path to: %s", value)
 			case "validate":
-				if value == "false" || value == "0" {
+				if strings.ToLower(value) == "false" || value == "0" {
 					config.SSL.InsecureSkipVerify = true
 					config.SSL.HostVerification = false
 					logger.DebugfToFile("CQLSHRC", "Set InsecureSkipVerify to true and HostVerification to false")
@@ -548,6 +711,12 @@ func loadCQLSHRC(path string, config *Config) error {
 
 	// If a credentials file was specified, try to load it
 	if credentialsPath != "" {
+		// Resolve relative paths relative to the cqlshrc file location
+		if !filepath.IsAbs(credentialsPath) && !strings.HasPrefix(credentialsPath, "~") {
+			cqlshrcDir := filepath.Dir(path)
+			credentialsPath = filepath.Join(cqlshrcDir, credentialsPath)
+			logger.DebugfToFile("CQLSHRC", "Resolved relative credentials path to: %s", credentialsPath)
+		}
 		logger.DebugfToFile("CQLSHRC", "Loading credentials file: %s", credentialsPath)
 		if err := loadCredentialsFile(credentialsPath, config); err != nil {
 			logger.DebugfToFile("CQLSHRC", "Failed to load credentials file: %v", err)
@@ -555,13 +724,13 @@ func loadCQLSHRC(path string, config *Config) error {
 			logger.DebugfToFile("CQLSHRC", "Successfully loaded credentials file")
 		}
 	}
-	
+
 	if err := scanner.Err(); err != nil {
 		logger.DebugfToFile("CQLSHRC", "Scanner error: %v", err)
 		return err
 	}
-	
-	logger.DebugfToFile("CQLSHRC", "Finished loading cqlshrc: host=%s, port=%d, username=%s, hasPassword=%v", 
+
+	logger.DebugfToFile("CQLSHRC", "Finished loading cqlshrc: host=%s, port=%d, username=%s, hasPassword=%v",
 		config.Host, config.Port, config.Username, config.Password != "")
 
 	return nil
@@ -574,20 +743,20 @@ func loadCQLSHRC(path string, config *Config) error {
 // password = pass
 func loadCredentialsFile(path string, config *Config) error {
 	logger.DebugfToFile("Credentials", "Loading credentials file: %s", path)
-	
+
 	// Expand ~ to home directory
 	if strings.HasPrefix(path, "~") {
 		path = filepath.Join(os.Getenv("HOME"), path[1:])
 		logger.DebugfToFile("Credentials", "Expanded path to: %s", path)
 	}
 
-	file, err := os.Open(path) // #nosec G304 - Config file path is validated
+	file, err := os.Open(path) // #nosec G304 G703 - Config file path is validated
 	if err != nil {
 		logger.DebugfToFile("Credentials", "Failed to open credentials file %s: %v", path, err)
 		return err
 	}
 	defer file.Close()
-	
+
 	logger.DebugfToFile("Credentials", "Successfully opened credentials file")
 
 	scanner := bufio.NewScanner(file)
@@ -602,8 +771,9 @@ func loadCredentialsFile(path string, config *Config) error {
 		if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") {
 			continue
 		}
-		
-		logger.DebugfToFile("Credentials", "Line %d: %s", lineNum, line)
+
+		// Don't log raw lines as they may contain passwords
+		logger.DebugfToFile("Credentials", "Processing line %d", lineNum)
 
 		// Check for section headers
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
@@ -621,7 +791,7 @@ func loadCredentialsFile(path string, config *Config) error {
 		// Parse key-value pairs
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
-			logger.DebugfToFile("Credentials", "Skipping invalid line %d (no '=' found): %s", lineNum, line)
+			logger.DebugfToFile("Credentials", "Skipping invalid line %d (no '=' found)", lineNum)
 			continue
 		}
 
@@ -645,13 +815,13 @@ func loadCredentialsFile(path string, config *Config) error {
 			logger.DebugfToFile("Credentials", "Ignoring unknown key: %s", key)
 		}
 	}
-	
+
 	if err := scanner.Err(); err != nil {
 		logger.DebugfToFile("Credentials", "Scanner error: %v", err)
 		return err
 	}
-	
-	logger.DebugfToFile("Credentials", "Finished loading credentials: username=%s, hasPassword=%v", 
+
+	logger.DebugfToFile("Credentials", "Finished loading credentials: username=%s, hasPassword=%v",
 		config.Username, config.Password != "")
 
 	return nil

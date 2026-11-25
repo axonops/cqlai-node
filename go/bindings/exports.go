@@ -15,6 +15,7 @@ import (
 	"github.com/axonops/cqlai-node/internal/batch"
 	"github.com/axonops/cqlai-node/internal/config"
 	"github.com/axonops/cqlai-node/internal/db"
+	"github.com/axonops/cqlai-node/internal/vault"
 )
 
 // getTraceIDIfEnabled returns the trace session ID only if tracing is currently enabled
@@ -91,6 +92,7 @@ func parseTableReference(query string, currentKeyspace string) (keyspace, table 
 var (
 	sessions      = make(map[int]*db.Session)
 	astraSessions = make(map[int]bool) // Track which sessions are Astra connections
+	expandModes   = make(map[int]bool) // Sessions with expand mode (vertical row display) on
 	sessionMutex  sync.RWMutex
 	nextHandle    = 1
 )
@@ -168,6 +170,25 @@ type SessionOptions struct {
 	// RSA credential decryption
 	RSAPrivateKey     string `json:"rsaPrivateKey"`     // PEM-encoded private key
 	RSAPrivateKeyFile string `json:"rsaPrivateKeyFile"` // Path to private key file
+
+	// Vault/OpenBao: read the username and password from the database secrets
+	// engine at VaultPath (e.g. database/creds/myrole). The other settings fall
+	// back to VAULT_ADDR/BAO_ADDR, VAULT_TOKEN/BAO_TOKEN or ~/.vault-token,
+	// VAULT_NAMESPACE/BAO_NAMESPACE and VAULT_CACERT/BAO_CACERT.
+	VaultPath      string `json:"vaultPath"`
+	VaultAddr      string `json:"vaultAddr"`
+	VaultToken     string `json:"vaultToken"`
+	VaultNamespace string `json:"vaultNamespace"`
+	VaultCACert    string `json:"vaultCaCert"` // Path to a PEM file
+}
+
+func (o *SessionOptions) vaultSettings() vault.Settings {
+	return vault.Settings{
+		Addr:      o.VaultAddr,
+		Token:     o.VaultToken,
+		Namespace: o.VaultNamespace,
+		CACert:    o.VaultCACert,
+	}
 }
 
 // QueryResult represents query results for JSON serialization
@@ -277,6 +298,7 @@ func resolveSessionOptions(opts *SessionOptions) error {
 	if opts.RSAPrivateKey != "" || opts.RSAPrivateKeyFile != "" {
 		opts.Username = tryDecryptCredential(opts.Username, opts.RSAPrivateKey, opts.RSAPrivateKeyFile)
 		opts.Password = tryDecryptCredential(opts.Password, opts.RSAPrivateKey, opts.RSAPrivateKeyFile)
+		opts.VaultToken = tryDecryptCredential(opts.VaultToken, opts.RSAPrivateKey, opts.RSAPrivateKeyFile)
 	}
 
 	return nil
@@ -347,6 +369,19 @@ func removeSession(handle int) {
 	defer sessionMutex.Unlock()
 	delete(sessions, handle)
 	delete(astraSessions, handle)
+	delete(expandModes, handle)
+}
+
+func setExpand(handle int, enabled bool) {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+	expandModes[handle] = enabled
+}
+
+func expandMode(handle int) bool {
+	sessionMutex.RLock()
+	defer sessionMutex.RUnlock()
+	return expandModes[handle]
 }
 
 // markSessionAsAstra marks a session as an Astra connection
@@ -384,6 +419,8 @@ func CreateSession(optionsJSON *C.char) *C.char {
 		Keyspace:       opts.Keyspace,
 		Username:       opts.Username,
 		Password:       opts.Password,
+		VaultPath:      opts.VaultPath,
+		Vault:          opts.vaultSettings(),
 		Consistency:    opts.Consistency,
 		ConnectTimeout: opts.ConnectTimeout,
 		RequestTimeout: opts.RequestTimeout,
@@ -443,8 +480,10 @@ func CloseSession(handle C.int) *C.char {
 		return jsonResponse(false, nil, "Invalid session handle", "INVALID_HANDLE")
 	}
 
-	session.Close()
+	// Remove the handle first: Close can wait on the Vault revocation, and
+	// nothing should run on the session meanwhile.
 	removeSession(h)
+	session.Close()
 	return jsonResponse(true, nil, "", "")
 }
 
@@ -819,7 +858,7 @@ func SetExpand(handle C.int, enabled C.int) *C.char {
 	}
 
 	isEnabled := enabled != 0
-	session.SetExpand(isEnabled)
+	setExpand(h, isEnabled)
 
 	return jsonResponse(true, map[string]interface{}{
 		"expand": isEnabled,
@@ -845,7 +884,7 @@ func GetSessionInfo(handle C.int) *C.char {
 		"serialConsistency": "SERIAL", // Default serial consistency
 		"pageSize":          session.PageSize(),
 		"tracing":           session.Tracing(),
-		"expand":            session.Expand(),
+		"expand":            expandMode(h),
 		"username":          session.Username(),
 		"host":              session.Host(),
 		"clusterName":       clusterName,
@@ -892,6 +931,8 @@ func TestConnection(optionsJSON *C.char) *C.char {
 		Keyspace:       opts.Keyspace,
 		Username:       opts.Username,
 		Password:       opts.Password,
+		VaultPath:      opts.VaultPath,
+		Vault:          opts.vaultSettings(),
 		Consistency:    opts.Consistency,
 		ConnectTimeout: opts.ConnectTimeout,
 		RequestTimeout: opts.RequestTimeout,
@@ -1026,6 +1067,8 @@ func TestConnectionWithID(optionsJSON *C.char) *C.char {
 		Keyspace:       opts.Keyspace,
 		Username:       opts.Username,
 		Password:       opts.Password,
+		VaultPath:      opts.VaultPath,
+		Vault:          opts.vaultSettings(),
 		Consistency:    opts.Consistency,
 		ConnectTimeout: opts.ConnectTimeout,
 		RequestTimeout: opts.RequestTimeout,
@@ -1066,7 +1109,13 @@ func TestConnectionWithID(optionsJSON *C.char) *C.char {
 	if cancelChan != nil {
 		select {
 		case <-cancelChan:
-			// Cancelled - we can't stop the goroutine but we won't use its result
+			// The connection cannot be stopped; close it when it is made, so
+			// that it and any Vault lease it holds are not left open.
+			go func() {
+				if res := <-resultChan; res.session != nil {
+					res.session.Close()
+				}
+			}()
 			return jsonResponse(false, nil, "Connection cancelled", "CANCELLED")
 		case res := <-resultChan:
 			if res.err != nil {
@@ -1558,7 +1607,12 @@ func TestAstraConnectionWithID(optionsJSON *C.char) *C.char {
 	if cancelChan != nil {
 		select {
 		case <-cancelChan:
-			CleanupAstraBundle(bundleInfo.ExtractedDir)
+			go func() {
+				if res := <-resultChan; res.session != nil {
+					res.session.Close()
+				}
+				_ = CleanupAstraBundle(bundleInfo.ExtractedDir)
+			}()
 			return jsonResponse(false, nil, "Connection cancelled", "CANCELLED")
 		case res := <-resultChan:
 			if res.err != nil {
@@ -2162,3 +2216,9 @@ func FreeString(str *C.char) {
 
 // Required for c-shared build mode
 func main() {}
+
+//export RevokeVaultLeases
+func RevokeVaultLeases() *C.char {
+	vault.RevokeAll()
+	return jsonResponse(true, nil, "", "")
+}
