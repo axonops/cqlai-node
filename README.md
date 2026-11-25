@@ -108,6 +108,14 @@ const result = await CQLSession.connect({
   consistency: 'LOCAL_QUORUM'
 });
 
+// Credentials from Vault or OpenBao (database secrets engine)
+const vaultResult = await CQLSession.connect({
+  host: '192.168.1.100',
+  vaultPath: 'database/creds/readonly',
+  vaultAddr: 'https://vault.example.com:8200', // or BAO_ADDR / VAULT_ADDR
+  vaultToken: process.env.MY_VAULT_TOKEN       // or BAO_TOKEN / VAULT_TOKEN
+});
+
 // DataStax Astra connection
 const astraResult = await CQLSession.connectWithAstraBundle({
   bundlePath: '/path/to/secure-connect-database.zip',

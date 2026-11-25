@@ -13,12 +13,16 @@ import (
 // This replaces the old implementation that maintained its own cache
 type SchemaCache struct {
 	Keyspaces   []string
-	Tables      map[string][]CachedTableInfo        // keyspace -> tables
+	Tables      map[string][]CachedTableInfo       // keyspace -> tables
 	Columns     map[string]map[string][]ColumnInfo // keyspace -> table -> columns
 	SearchIndex *SearchIndex                       // Pre-computed fuzzy search index
 	LastRefresh time.Time
 	Mu          sync.RWMutex
-	session     *Session
+
+	// virtual is the keyspaces the node computes rather than stores, found
+	// once per refresh rather than asked about for every table.
+	virtual map[string]bool
+	session *Session
 }
 
 // CachedTableInfo extends TableInfo with cache-specific fields
@@ -36,9 +40,9 @@ type SearchIndex struct {
 // NewSchemaCache creates a new schema cache using gocql metadata
 func NewSchemaCache(session *Session) *SchemaCache {
 	return &SchemaCache{
-		session:     session,
-		Tables:      make(map[string][]CachedTableInfo),
-		Columns:     make(map[string]map[string][]ColumnInfo),
+		session: session,
+		Tables:  make(map[string][]CachedTableInfo),
+		Columns: make(map[string]map[string][]ColumnInfo),
 		SearchIndex: &SearchIndex{
 			TableTokens: make(map[string][]string),
 		},
@@ -70,6 +74,14 @@ func (sc *SchemaCache) GetAllKeyspaces() ([]string, error) {
 		return nil, fmt.Errorf("failed to get keyspaces: %w", err)
 	}
 
+	// The virtual keyspaces are listed in system_virtual_schema, not
+	// system_schema. Without them the CHAT view's tools - and the MCP server's,
+	// which are the same ones - could not see system_views at all.
+	sc.virtual = map[string]bool{}
+	for _, ks := range sc.session.VirtualKeyspaces() {
+		sc.virtual[ks] = true
+		keyspaces = append(keyspaces, ks)
+	}
 	return keyspaces, nil
 }
 
@@ -77,6 +89,23 @@ func (sc *SchemaCache) GetAllKeyspaces() ([]string, error) {
 func (sc *SchemaCache) GetKeyspaceTables(keyspace string) ([]CachedTableInfo, error) {
 	if sc.session == nil || sc.session.Session == nil {
 		return nil, fmt.Errorf("no session available")
+	}
+
+	// The driver's metadata does not cover virtual keyspaces.
+	if sc.virtual[keyspace] {
+		var tables []CachedTableInfo
+		for _, t := range sc.session.virtualTableList(keyspace) {
+			tables = append(tables, CachedTableInfo{
+				TableInfo: TableInfo{
+					KeyspaceName:   keyspace,
+					TableName:      t.Name,
+					PartitionKeys:  t.PartitionKeys,
+					ClusteringKeys: t.ClusteringKeys,
+				},
+				LastUpdated: time.Now(),
+			})
+		}
+		return tables, nil
 	}
 
 	// Use gocql's metadata API
@@ -114,6 +143,10 @@ func (sc *SchemaCache) GetKeyspaceTables(keyspace string) ([]CachedTableInfo, er
 func (sc *SchemaCache) GetTableColumns(keyspace, table string) ([]ColumnInfo, error) {
 	if sc.session == nil || sc.session.Session == nil {
 		return nil, fmt.Errorf("no session available")
+	}
+
+	if sc.virtual[keyspace] {
+		return sc.session.virtualColumnInfo(keyspace, table), nil
 	}
 
 	// Get table metadata from gocql

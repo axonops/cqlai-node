@@ -2,8 +2,10 @@ package db
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
+	"github.com/axonops/cqlai-node/internal/logger"
 	"github.com/axonops/cqlai-node/internal/session"
 )
 
@@ -44,32 +46,32 @@ func (s *Session) GetSchemaCatalog() (*SchemaCatalog, error) {
 	// Get all keyspaces
 	keyspaceQuery := `SELECT keyspace_name FROM system_schema.keyspaces`
 	iter := s.Query(keyspaceQuery).Iter()
-	
+
 	var keyspaceName string
 	for iter.Scan(&keyspaceName) {
 		// Skip system keyspaces unless explicitly requested
 		if strings.HasPrefix(keyspaceName, "system") {
 			continue
 		}
-		
+
 		ks := &KeyspaceSchema{
 			Name:   keyspaceName,
 			Tables: make(map[string]*TableSchema),
 		}
-		
+
 		// Get tables for this keyspace
 		if err := s.loadTablesForKeyspace(ks); err != nil {
 			_ = iter.Close()
 			return nil, fmt.Errorf("failed to load tables for keyspace %s: %v", keyspaceName, err)
 		}
-		
+
 		catalog.Keyspaces[keyspaceName] = ks
 	}
-	
+
 	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("failed to retrieve keyspaces: %v", err)
 	}
-	
+
 	return catalog, nil
 }
 
@@ -79,11 +81,11 @@ func (s *Session) GetKeyspaceSchema(keyspace string) (*KeyspaceSchema, error) {
 		Name:   keyspace,
 		Tables: make(map[string]*TableSchema),
 	}
-	
+
 	if err := s.loadTablesForKeyspace(ks); err != nil {
 		return nil, fmt.Errorf("failed to load tables for keyspace %s: %v", keyspace, err)
 	}
-	
+
 	return ks, nil
 }
 
@@ -96,45 +98,65 @@ func (s *Session) GetTableSchema(keyspace, table string) (*TableSchema, error) {
 		PartitionKeys:  []string{},
 		ClusteringKeys: []string{},
 	}
-	
-	// Get columns
+
+	// Get columns.
+	//
+	// Deliberately no ORDER BY: system_schema.columns is clustered by
+	// column_name, and Cassandra rejects ordering by anything else with
+	// "Order by is currently only supported on the clustered columns of the
+	// PRIMARY KEY". Asking for ORDER BY position failed every call, and the
+	// caller swallowed the error, so no table was ever loaded. Sort in Go
+	// instead.
 	columnQuery := `
-		SELECT column_name, type, kind, position 
-		FROM system_schema.columns 
-		WHERE keyspace_name = ? AND table_name = ?
-		ORDER BY position`
-	
+		SELECT column_name, type, kind, position
+		FROM system_schema.columns
+		WHERE keyspace_name = ? AND table_name = ?`
+
 	iter := s.Query(columnQuery, keyspace, table).Iter()
-	
+
 	var colName, colType, colKind string
 	var position int
-	
+
 	for iter.Scan(&colName, &colType, &colKind, &position) {
-		col := ColumnSchema{
+		ts.Columns = append(ts.Columns, ColumnSchema{
 			Name:     colName,
 			Type:     colType,
 			Kind:     colKind,
 			Position: position,
-		}
-		ts.Columns = append(ts.Columns, col)
-		
-		// Track partition and clustering keys
-		switch colKind {
-		case "partition_key":
-			ts.PartitionKeys = append(ts.PartitionKeys, colName)
-		case "clustering":
-			ts.ClusteringKeys = append(ts.ClusteringKeys, colName)
-		}
+		})
 	}
-	
+
 	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("failed to retrieve columns: %v", err)
 	}
-	
+
+	// Partition keys first, then clustering keys, then the rest; within a kind,
+	// by position.
+	kindPriority := map[string]int{"partition_key": 0, "clustering": 1, "regular": 2}
+	sort.SliceStable(ts.Columns, func(i, j int) bool {
+		iPriority, jPriority := kindPriority[ts.Columns[i].Kind], kindPriority[ts.Columns[j].Kind]
+		if iPriority != jPriority {
+			return iPriority < jPriority
+		}
+		return ts.Columns[i].Position < ts.Columns[j].Position
+	})
+
+	// Collect the key names only once sorted. Taking them during the scan gives
+	// alphabetical order, which describes a different table: partition key
+	// order decides how rows are distributed, clustering order how they sort.
+	for _, col := range ts.Columns {
+		switch col.Kind {
+		case "partition_key":
+			ts.PartitionKeys = append(ts.PartitionKeys, col.Name)
+		case "clustering":
+			ts.ClusteringKeys = append(ts.ClusteringKeys, col.Name)
+		}
+	}
+
 	if len(ts.Columns) == 0 {
 		return nil, fmt.Errorf("table %s.%s not found", keyspace, table)
 	}
-	
+
 	return ts, nil
 }
 
@@ -154,16 +176,19 @@ func (s *Session) GetCurrentKeyspaceSchema(sessionMgr *session.Manager) (*Keyspa
 func (s *Session) loadTablesForKeyspace(ks *KeyspaceSchema) error {
 	tableQuery := `SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?`
 	iter := s.Query(tableQuery, ks.Name).Iter()
-	
+
 	var tableName string
 	for iter.Scan(&tableName) {
 		ts, err := s.GetTableSchema(ks.Name, tableName)
 		if err != nil {
-			continue // Skip tables we can't load
+			// Log rather than skip in silence. A whole schema disappearing
+			// with no message is why the broken query above went unnoticed.
+			logger.DebugfToFile("Schema", "Skipping table %s.%s: %v", ks.Name, tableName, err)
+			continue
 		}
 		ks.Tables[tableName] = ts
 	}
-	
+
 	return iter.Close()
 }
 
@@ -173,25 +198,25 @@ func (s *Session) GetSchemaContext(limit int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	var sb strings.Builder
 	count := 0
-	
+
 	for ksName, ks := range catalog.Keyspaces {
 		if count >= limit {
 			break
 		}
-		
-		sb.WriteString(fmt.Sprintf("Keyspace: %s\n", ksName))
-		
+
+		fmt.Fprintf(&sb, "Keyspace: %s\n", ksName)
+
 		for tableName, table := range ks.Tables {
 			if count >= limit {
 				break
 			}
-			
-			sb.WriteString(fmt.Sprintf("  Table: %s\n", tableName))
+
+			fmt.Fprintf(&sb, "  Table: %s\n", tableName)
 			sb.WriteString("    Columns:\n")
-			
+
 			for _, col := range table.Columns {
 				marker := ""
 				switch col.Kind {
@@ -200,11 +225,11 @@ func (s *Session) GetSchemaContext(limit int) (string, error) {
 				case "clustering":
 					marker = " (CK)"
 				}
-				sb.WriteString(fmt.Sprintf("      - %s: %s%s\n", col.Name, col.Type, marker))
+				fmt.Fprintf(&sb, "      - %s: %s%s\n", col.Name, col.Type, marker)
 			}
 			count++
 		}
 	}
-	
+
 	return sb.String(), nil
 }

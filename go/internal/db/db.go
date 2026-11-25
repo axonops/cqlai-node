@@ -1,19 +1,24 @@
 package db
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/axonops/cqlai-node/internal/config"
 	"github.com/axonops/cqlai-node/internal/logger"
+	"github.com/axonops/cqlai-node/internal/telemetry"
+	"github.com/axonops/cqlai-node/internal/vault"
 )
 
 // Session is a wrapper around the gocql.Session.
@@ -24,13 +29,72 @@ type Session struct {
 	pageSize         int
 	tracing          bool
 	autoFetch        bool   // Auto-fetch all pages without scroll pauses
-	expand           bool   // Expand mode (vertical row display)
 	username         string // Current connection username
-	host             string // Connection host
 	cassandraVersion string
+	vault            *vault.Client
+	leaseID          string
 	schemaCache      *SchemaCache
 	udtRegistry      *UDTRegistry
-	lastTraceID      []byte // Store the last trace ID for retrieval
+
+	// The traces of the requests this query has made, in the order they were
+	// made.
+	//
+	// A paged query is one request per page, each traced separately by
+	// Cassandra under its own session id, and every one of them is kept: a
+	// trace of the last page alone says a scan read sixty-five rows when the
+	// query read five hundred. The driver hands them over on whichever
+	// goroutine fetched the page, which is why they are behind a lock.
+	traceMu  sync.Mutex
+	traceIDs [][]byte
+}
+
+// Close closes the connection and revokes the Vault lease its credentials
+// came with, if any.
+func (s *Session) Close() {
+	s.Session.Close()
+	if s.vault != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		s.vault.Revoke(ctx, s.leaseID)
+	}
+}
+
+// tracedPagesKept is how many pages of a query are held on to.
+//
+// A query read to the end with auto-fetch on is hundreds of requests, and a
+// trace of all of them is a table nobody reads and a question no model should
+// be asked to answer. The most recent are the ones worth having; the summary
+// says when there were more.
+const tracedPagesKept = 20
+
+// noteTrace records the trace of a request that has just come back.
+func (s *Session) noteTrace(traceID []byte) {
+	s.traceMu.Lock()
+	defer s.traceMu.Unlock()
+
+	kept := make([]byte, len(traceID))
+	copy(kept, traceID)
+	s.traceIDs = append(s.traceIDs, kept)
+}
+
+// startTracing forgets the traces of the query before this one.
+func (s *Session) startTracing() {
+	s.traceMu.Lock()
+	defer s.traceMu.Unlock()
+
+	s.traceIDs = nil
+}
+
+// tracedRequests is the traces to show and how many requests the query made,
+// which are not the same number once a query has run to more pages than are
+// kept.
+func (s *Session) tracedRequests() (ids [][]byte, made int) {
+	s.traceMu.Lock()
+	defer s.traceMu.Unlock()
+
+	made = len(s.traceIDs)
+	from := max(made-tracedPagesKept, 0)
+	return append([][]byte{}, s.traceIDs[from:]...), made
 }
 
 // SessionOptions represents options for creating a session with command-line overrides
@@ -42,10 +106,12 @@ type SessionOptions struct {
 	Password       string
 	Consistency    string // Default consistency level (e.g., "LOCAL_ONE", "QUORUM")
 	SSL            *config.SSLConfig
-	BatchMode      bool   // Skip schema caching for batch mode
-	ConnectTimeout int    // Connection timeout in seconds (0 = use default)
-	RequestTimeout int    // Request timeout in seconds (0 = use default)
-	ConfigFile     string // Path to custom config file
+	BatchMode      bool           // Skip schema caching for batch mode
+	ConnectTimeout int            // Connection timeout in seconds (0 = use default)
+	RequestTimeout int            // Request timeout in seconds (0 = use default)
+	ConfigFile     string         // Path to custom config file
+	VaultPath      string         // Read the username and password from this Vault path
+	Vault          vault.Settings // Vault server and token; empty fields come from the environment
 }
 
 // NewSession creates a new Cassandra session.
@@ -82,10 +148,10 @@ func NewSessionWithOptions(options SessionOptions) (*Session, error) {
 				Provider: "mock",
 			},
 		}
-		logger.DebugfToFile("Session", "Using default config: host=%s, port=%d, username=%s", 
+		logger.DebugfToFile("Session", "Using default config: host=%s, port=%d, username=%s",
 			cfg.Host, cfg.Port, cfg.Username)
 	} else {
-		logger.DebugfToFile("Session", "Loaded config: host=%s, port=%d, username=%s, keyspace=%s, hasPassword=%v", 
+		logger.DebugfToFile("Session", "Loaded config: host=%s, port=%d, username=%s, keyspace=%s, hasPassword=%v",
 			cfg.Host, cfg.Port, cfg.Username, cfg.Keyspace, cfg.Password != "")
 	}
 
@@ -110,14 +176,43 @@ func NewSessionWithOptions(options SessionOptions) (*Session, error) {
 		cfg.Password = options.Password
 		logger.DebugfToFile("Session", "Overriding password with command-line option")
 	}
+	// Only the caller's path counts: the one in the file may belong to another
+	// connection than the one being opened.
+	cfg.VaultPath = options.VaultPath
+	var vaultClient *vault.Client
+	var leaseID string
+	if cfg.VaultPath != "" {
+		vaultClient, err = vault.FromSettings(options.Vault)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		creds, err := vaultClient.ReadCredentials(ctx, cfg.VaultPath)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		cfg.Username, cfg.Password, leaseID = creds.Username, creds.Password, creds.LeaseID
+		logger.DebugfToFile("Session", "Using credentials from Vault path %s, username=%s", cfg.VaultPath, cfg.Username)
+	}
+	// Nothing else will revoke the lease if the connection is not made.
+	connected := false
+	defer func() {
+		if !connected && vaultClient != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			vaultClient.Revoke(ctx, leaseID)
+		}
+	}()
+
 	// Override SSL config if provided
 	if options.SSL != nil {
 		cfg.SSL = options.SSL
 		logger.DebugfToFile("Session", "Overriding SSL config with command-line option")
 	}
-	
+
 	// Log final configuration being used
-	logger.DebugfToFile("Session", "Final config for connection: host=%s:%d, username=%s, keyspace=%s, hasPassword=%v", 
+	logger.DebugfToFile("Session", "Final config for connection: host=%s:%d, username=%s, keyspace=%s, hasPassword=%v",
 		cfg.Host, cfg.Port, cfg.Username, cfg.Keyspace, cfg.Password != "")
 
 	// Create cluster configuration
@@ -125,7 +220,7 @@ func NewSessionWithOptions(options SessionOptions) (*Session, error) {
 	// Suppress gocql's default logging to prevent terminal corruption
 	cluster.Logger = &customLogger{}
 	cluster.Consistency = gocql.LocalOne
-	
+
 	// Set timeouts based on options, config, or use defaults
 	switch {
 	case options.RequestTimeout > 0:
@@ -135,7 +230,7 @@ func NewSessionWithOptions(options SessionOptions) (*Session, error) {
 	default:
 		cluster.Timeout = 10 * time.Second
 	}
-	
+
 	switch {
 	case options.ConnectTimeout > 0:
 		cluster.ConnectTimeout = time.Duration(options.ConnectTimeout) * time.Second
@@ -144,7 +239,7 @@ func NewSessionWithOptions(options SessionOptions) (*Session, error) {
 	default:
 		cluster.ConnectTimeout = 10 * time.Second
 	}
-	
+
 	cluster.DisableInitialHostLookup = true
 
 	if cfg.Keyspace != "" {
@@ -169,13 +264,24 @@ func NewSessionWithOptions(options SessionOptions) (*Session, error) {
 		}
 	}
 
+	if cfg.OTel != nil && cfg.OTel.Enabled {
+		if err := telemetry.Start(context.Background()); err != nil {
+			logger.DebugfToFile("Session", "OpenTelemetry tracing not started: %v", err)
+		}
+	}
+	if tp := telemetry.TracerProvider(); tp != nil {
+		observer := telemetry.NewObserver(tp)
+		cluster.QueryObserver = observer
+		cluster.BatchObserver = observer
+	}
+
 	// Try to connect with progressively lower protocol versions
 	// Protocol v5: Cassandra 3.10+, 4.0+, 5.0+
 	// Protocol v4: Cassandra 3.0+
 	// Protocol v3: Cassandra 2.1+
 	var session *gocql.Session
 	protocolVersions := []int{5, 4, 3}
-	
+
 	for _, protoVer := range protocolVersions {
 		cluster.ProtoVersion = protoVer
 		session, err = cluster.CreateSession()
@@ -187,7 +293,7 @@ func NewSessionWithOptions(options SessionOptions) (*Session, error) {
 		// Log the failure and try next version
 		logger.DebugfToFile("Session", "Failed to connect with protocol version %d: %v", protoVer, err)
 	}
-	
+
 	if session == nil {
 		return nil, fmt.Errorf("failed to connect to Cassandra with any supported protocol version: %v", err)
 	}
@@ -250,16 +356,24 @@ func NewSessionWithOptions(options SessionOptions) (*Session, error) {
 		}
 	}
 
+	// Use page size from config, default to 100 if not set
+	pageSize := cfg.PageSize
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+
 	s := &Session{
 		Session:          session,
 		cluster:          cluster,
 		consistency:      initialConsistency,
-		pageSize:         100,
+		pageSize:         pageSize,
 		tracing:          false,
 		username:         cfg.Username,
-		host:             cfg.Host,
 		cassandraVersion: releaseVersion,
+		vault:            vaultClient,
+		leaseID:          leaseID,
 	}
+	connected = true
 
 	// Initialize schema cache for AI features (skip in batch mode)
 	if !options.BatchMode {
@@ -295,62 +409,6 @@ func loadConfig(customConfigPath string) (*config.Config, error) {
 	return conf, nil
 }
 
-
-// Consistency returns the current consistency level
-func (s *Session) Consistency() string {
-	switch s.consistency {
-	case gocql.Any:
-		return "ANY"
-	case gocql.One:
-		return "ONE"
-	case gocql.Two:
-		return "TWO"
-	case gocql.Three:
-		return "THREE"
-	case gocql.Quorum:
-		return "QUORUM"
-	case gocql.All:
-		return "ALL"
-	case gocql.LocalQuorum:
-		return "LOCAL_QUORUM"
-	case gocql.EachQuorum:
-		return "EACH_QUORUM"
-	case gocql.LocalOne:
-		return "LOCAL_ONE"
-	default:
-		return "UNKNOWN"
-	}
-}
-
-// SetConsistency sets the consistency level
-func (s *Session) SetConsistency(level string) error {
-	var consistency gocql.Consistency
-	switch level {
-	case "ANY":
-		consistency = gocql.Any
-	case "ONE":
-		consistency = gocql.One
-	case "TWO":
-		consistency = gocql.Two
-	case "THREE":
-		consistency = gocql.Three
-	case "QUORUM":
-		consistency = gocql.Quorum
-	case "ALL":
-		consistency = gocql.All
-	case "LOCAL_QUORUM":
-		consistency = gocql.LocalQuorum
-	case "EACH_QUORUM":
-		consistency = gocql.EachQuorum
-	case "LOCAL_ONE":
-		consistency = gocql.LocalOne
-	default:
-		return fmt.Errorf("invalid consistency level: %s", level)
-	}
-	s.consistency = consistency
-	return nil
-}
-
 // PageSize returns the current page size
 func (s *Session) PageSize() int {
 	return s.pageSize
@@ -381,37 +439,18 @@ func (s *Session) SetAutoFetch(enabled bool) {
 	s.autoFetch = enabled
 }
 
-// Expand returns whether expand mode is enabled
-func (s *Session) Expand() bool {
-	return s.expand
-}
-
-// SetExpand enables or disables expand mode (vertical row display)
-func (s *Session) SetExpand(enabled bool) {
-	s.expand = enabled
-}
-
 // Username returns the current connection username
 func (s *Session) Username() string {
 	return s.username
 }
 
-// Host returns the connection host
-func (s *Session) Host() string {
-	return s.host
-}
-
-// GocqlSession returns the underlying gocql.Session
-func (s *Session) GocqlSession() *gocql.Session {
-	return s.Session
-}
-
-// LastTraceID returns the last trace session ID as a hex string
-func (s *Session) LastTraceID() string {
-	if s.lastTraceID == nil {
+// AuthenticatedUser is the user the connection logged in as, or "" when it
+// did not log in. A username in the settings with no password is not used.
+func (s *Session) AuthenticatedUser() string {
+	if s.cluster == nil || s.cluster.Authenticator == nil {
 		return ""
 	}
-	return fmt.Sprintf("%x", s.lastTraceID)
+	return s.username
 }
 
 // Query creates a new query with session defaults applied
@@ -452,6 +491,22 @@ func (s *Session) IsVersion4OrHigher() bool {
 	return majorVersion >= 4
 }
 
+// HasJSON reports whether the cluster reads and writes JSON: SELECT JSON,
+// INSERT JSON and fromJson, from Cassandra 2.2. An unknown version is taken
+// to be a current one.
+func (s *Session) HasJSON() bool {
+	parts := strings.Split(s.CassandraVersion(), ".")
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return true
+	}
+	minor := 0
+	if len(parts) > 1 {
+		minor, _ = strconv.Atoi(parts[1])
+	}
+	return major > 2 || (major == 2 && minor >= 2)
+}
+
 // IsVersion3OrHigher checks if the Cassandra version is 3.0 or higher
 func (s *Session) IsVersion3OrHigher() bool {
 	version := s.CassandraVersion()
@@ -477,68 +532,100 @@ func (s *Session) GetSchemaCache() *SchemaCache {
 // TraceInfo holds trace session summary information
 type TraceInfo struct {
 	Coordinator string
-	Duration    int
+
+	// Duration is how long the query took across every request it made, which
+	// for a paged query is the sum of its pages.
+	Duration int
+
+	// Pages is how many requests the query made, and Shown how many of them
+	// the events below are from: a query read to the end makes hundreds, and
+	// only the most recent are kept.
+	Pages int
+	Shown int
 }
 
-// GetTraceData retrieves trace data for the last executed query
+// GetTraceData retrieves the trace of the last query, across every page of it.
+//
+// A paged query is one traced request per page, and the page last fetched is
+// not the query: a trace of that alone says a scan read sixty-five rows when
+// the query read five hundred. The events of every page kept are returned
+// together, each one saying which page it came from.
 func (s *Session) GetTraceData() ([][]string, []string, *TraceInfo, error) {
-	if s.lastTraceID == nil {
+	traceIDs, made := s.tracedRequests()
+	if len(traceIDs) == 0 {
 		return nil, nil, nil, fmt.Errorf("no trace data available")
 	}
 
-	// Query the system_traces.events table for trace events
-	// Note: Always use LOCAL_ONE consistency for system_traces queries
-	// because trace data may not be replicated to all nodes yet
-	query := `SELECT event_id, activity, source, source_elapsed, thread
-	          FROM system_traces.events
-	          WHERE session_id = ?
-	          ORDER BY event_id`
-
-	// Use LOCAL_ONE consistency for trace queries regardless of session consistency
-	iter := s.Session.Query(query, s.lastTraceID).Consistency(gocql.LocalOne).Iter()
-	defer iter.Close()
-
-	// Define headers
+	// The page column earns its place only when there is more than one.
+	paged := len(traceIDs) > 1
 	headers := []string{"Event", "Activity", "Source", "Source Elapsed (μs)", "Thread"}
+	if paged {
+		headers = append([]string{"Page"}, headers...)
+	}
 
-	// Collect results
+	// Always LOCAL_ONE for system_traces: trace data may not be replicated to
+	// all nodes yet.
+	const events = `SELECT event_id, activity, source, source_elapsed, thread
+	                FROM system_traces.events
+	                WHERE session_id = ?
+	                ORDER BY event_id`
+	const session = `SELECT coordinator, duration
+	                 FROM system_traces.sessions
+	                 WHERE session_id = ?`
+
 	var results [][]string
+	info := &TraceInfo{Pages: made}
+	first := made - len(traceIDs) // the page the kept ones start at
 
-	var eventID gocql.UUID
-	var activity, source, thread string
-	var sourceElapsed int
+	for i, traceID := range traceIDs {
+		page := first + i + 1
+		before := len(results)
 
-	for iter.Scan(&eventID, &activity, &source, &sourceElapsed, &thread) {
-		row := []string{
-			eventID.String()[:8], // Short event ID
-			activity,
-			source,
-			fmt.Sprintf("%d", sourceElapsed),
-			thread,
+		iter := s.Session.Query(events, traceID).Consistency(gocql.LocalOne).Iter()
+
+		var eventID gocql.UUID
+		var activity, source, thread string
+		var sourceElapsed int
+
+		for iter.Scan(&eventID, &activity, &source, &sourceElapsed, &thread) {
+			row := []string{
+				eventID.String()[:8], // Short event ID
+				activity,
+				source,
+				fmt.Sprintf("%d", sourceElapsed),
+				thread,
+			}
+			if paged {
+				row = append([]string{fmt.Sprintf("%d", page)}, row...)
+			}
+			results = append(results, row)
 		}
-		results = append(results, row)
-	}
-
-	if err := iter.Close(); err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to retrieve trace data: %v", err)
-	}
-
-	// Get session info - also use LOCAL_ONE consistency
-	var traceInfo *TraceInfo
-	var coordinator string
-	var duration int
-	sessionIter := s.Session.Query(`SELECT coordinator, duration
-	                                FROM system_traces.sessions
-	                                WHERE session_id = ?`, s.lastTraceID).Consistency(gocql.LocalOne).Iter()
-	if sessionIter.Scan(&coordinator, &duration) {
-		traceInfo = &TraceInfo{
-			Coordinator: coordinator,
-			Duration:    duration,
+		if err := iter.Close(); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to retrieve trace data: %v", err)
 		}
-	}
-	_ = sessionIter.Close()
 
-	return results, headers, traceInfo, nil
+		// Cassandra writes a trace after answering, so the newest page - or
+		// the oldest, read the moment it was asked for - can have nothing
+		// under it yet. Shown counts the pages that did.
+		if len(results) == before {
+			continue
+		}
+		info.Shown++
+
+		var coordinator string
+		var duration int
+		summary := s.Session.Query(session, traceID).Consistency(gocql.LocalOne).Iter()
+		if summary.Scan(&coordinator, &duration) {
+			info.Coordinator = coordinator
+			info.Duration += duration
+		}
+		_ = summary.Close()
+	}
+
+	if len(results) == 0 {
+		return nil, nil, nil, fmt.Errorf("no trace data available")
+	}
+	return results, headers, info, nil
 }
 
 // Keyspace returns the current keyspace
@@ -567,8 +654,9 @@ func (s *Session) GetColumnTypeFromSystemTable(keyspace, table, column string) s
 
 // SetKeyspace changes the current keyspace by recreating the session
 func (s *Session) SetKeyspace(keyspace string) error {
-	// Close the current session
-	s.Close()
+	// Close only the connection: s.Close would revoke the Vault lease the new
+	// connection is about to log in with.
+	s.Session.Close()
 
 	// Update cluster config with new keyspace
 	s.cluster.Keyspace = keyspace
@@ -590,11 +678,27 @@ func (s *Session) SetKeyspace(keyspace string) error {
 	return nil
 }
 
+// expandPath expands ~ to the user's home directory
+func expandPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home := os.Getenv("HOME")
+		if home == "" {
+			// Fallback for systems where HOME is not set
+			if userHome, err := os.UserHomeDir(); err == nil {
+				home = userHome
+			}
+		}
+		if home != "" {
+			return filepath.Join(home, path[1:])
+		}
+	}
+	return path
+}
+
 // createTLSConfig creates a TLS configuration based on the SSL settings
 func createTLSConfig(sslConfig *config.SSLConfig, hostname string) (*tls.Config, error) {
 	// Determine server name for hostname verification
-	// Use explicit ServerName from config if provided (for SNI routing like Astra),
-	// otherwise derive from hostname
+	// An explicit ServerName (SNI routing, as Astra needs) wins over the host.
 	serverName := sslConfig.ServerName
 	if serverName == "" {
 		serverName = hostname
@@ -621,7 +725,9 @@ func createTLSConfig(sslConfig *config.SSLConfig, hostname string) (*tls.Config,
 
 	// Load client certificate if provided
 	if sslConfig.CertPath != "" && sslConfig.KeyPath != "" {
-		cert, err := tls.LoadX509KeyPair(sslConfig.CertPath, sslConfig.KeyPath)
+		certPath := expandPath(sslConfig.CertPath)
+		keyPath := expandPath(sslConfig.KeyPath)
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load client certificate: %v", err)
 		}
@@ -630,7 +736,8 @@ func createTLSConfig(sslConfig *config.SSLConfig, hostname string) (*tls.Config,
 
 	// Load CA certificate if provided
 	if sslConfig.CAPath != "" {
-		caCert, err := os.ReadFile(sslConfig.CAPath)
+		caPath := expandPath(sslConfig.CAPath)
+		caCert, err := os.ReadFile(caPath) // #nosec G304 - Path from trusted user configuration
 		if err != nil {
 			return nil, fmt.Errorf("failed to read CA certificate: %v", err)
 		}

@@ -17,6 +17,7 @@ Complete API documentation for the `cqlai-node` package - native Node.js binding
   - [parseAstraBundle()](#cqlsessionparseastrabundleoptions)
   - [validateAstraBundle()](#cqlsessionvalidateastrabundlebundlepath)
   - [cleanupAstraBundle()](#cqlsessioncleanupastrabundleextracteddir)
+  - [revokeVaultLeases()](#cqlsessionrevokevaultleases)
 - [Instance Methods](#instance-methods)
   - [execute()](#sessionexecutecql-options)
   - [executeMulti()](#sessionexecutemulticql-options)
@@ -35,6 +36,7 @@ Complete API documentation for the `cqlai-node` package - native Node.js binding
   - [executeSourceFiles()](#sessionexecutesourcefilesoptions)
   - [close()](#sessionclose)
 - [Instance Properties](#instance-properties)
+- [Credentials from Vault or OpenBao](#credentials-from-vault-or-openbao)
 - [Shell Commands](#shell-commands)
 - [Error Handling](#error-handling)
 - [Consistency Levels](#consistency-levels)
@@ -75,8 +77,13 @@ Connect to a Cassandra cluster and create a session.
 | `options.requestTimeout`    | `number` | -             | Request timeout in seconds                            |
 | `options.rsaPrivateKey`     | `string` | -             | PEM-encoded RSA private key for credential decryption |
 | `options.rsaPrivateKeyFile` | `string` | -             | Path to RSA private key file                          |
+| `options.vaultPath`         | `string` | -             | Read the username and password from this Vault/OpenBao path, e.g. `database/creds/myrole`. See [Credentials from Vault or OpenBao](#credentials-from-vault-or-openbao) |
+| `options.vaultAddr`         | `string` | `BAO_ADDR` or `VAULT_ADDR` | Vault/OpenBao address                    |
+| `options.vaultToken`        | `string` | `BAO_TOKEN`, `VAULT_TOKEN` or `~/.vault-token` | Vault/OpenBao token, plaintext or RSA-encrypted |
+| `options.vaultNamespace`    | `string` | `BAO_NAMESPACE` or `VAULT_NAMESPACE` | Vault/OpenBao namespace        |
+| `options.vaultCaCert`       | `string` | `BAO_CACERT` or `VAULT_CACERT` | Path to the CA certificate of the Vault server |
 
-**Returns:** `Promise<{ success: boolean, data?: CQLSession, error?: string }>`
+**Returns:** `Promise<{ success: boolean, data?: CQLSession, error?: string, code?: string }>`
 
 **Example:**
 
@@ -249,6 +256,19 @@ Clean up extracted Astra bundle files.
 | `extractedDir` | `string` | Yes      | Directory containing extracted bundle |
 
 **Returns:** `Promise<{ success: boolean, error?: string }>`
+
+---
+
+### `CQLSession.revokeVaultLeases()`
+
+Revoke every Vault/OpenBao lease that is still open. `session.close()` already
+revokes the lease of its own session, and the leases still open on a normal
+process exit are revoked then. Node does not run exit handlers on an unhandled
+signal (SIGINT, SIGTERM) or a crash, so call this from the application's own
+quit or signal handler. Revoking waits for the Vault server, up to 10 seconds
+in total, so an exit with Vault unreachable can stall for that long.
+
+**Returns:** `Promise<{ success: boolean }>`
 
 ---
 
@@ -671,7 +691,8 @@ Execute multiple CQL files (SOURCE command equivalent).
 
 ### `session.close()`
 
-Close the session.
+Close the session. A session whose credentials came from Vault also revokes
+their lease, which drops the database user.
 
 **Returns:** `Promise<{ success: boolean, error?: string }>`
 
@@ -709,6 +730,46 @@ Get prompt components for rendering.
 | `session.cassandraVersion` | `string` | Cassandra version (e.g., `'4.1.3'`) |
 | `session.keyspace`         | `string` | Current keyspace                    |
 | `session.handle`           | `number` | Internal session handle             |
+
+---
+
+## Credentials from Vault or OpenBao
+
+With `vaultPath`, the username and password are read from the
+[database secrets engine](https://openbao.org/docs/secrets/databases/cassandra/)
+of a Vault or OpenBao server just before connecting, instead of from
+`username` and `password`. `connect()`, `testConnection()` and
+`testConnectionWithID()` all accept it.
+
+```javascript
+const result = await CQLSession.connect({
+  host: '192.168.1.100',
+  vaultPath: 'database/creds/readonly',
+  vaultAddr: 'https://vault.example.com:8200',
+  vaultToken: process.env.MY_VAULT_TOKEN, // or leave out to use VAULT_TOKEN / ~/.vault-token
+});
+```
+
+- Each Vault setting left out comes from the environment, as the `vault` and
+  `bao` command line tools read it. An application started from a desktop
+  launcher usually has no shell environment, so pass at least `vaultAddr` and
+  `vaultToken` there.
+- `vaultToken` is decrypted with `rsaPrivateKey` or `rsaPrivateKeyFile` when
+  either is given, as `username` and `password` are.
+- `testConnection()` and `testConnectionWithID()` revoke their lease as soon
+  as the test ends.
+- The lease is revoked when the session is closed, when the connection fails,
+  when a cancelled `testConnectionWithID()` finishes connecting, and on a
+  normal process exit. On SIGINT, SIGTERM or a crash it is not: call
+  `CQLSession.revokeVaultLeases()` from a quit or signal handler, or the lease
+  runs out at its TTL. A token that may read credentials but not revoke them
+  is not an error: the lease then runs out at its TTL.
+- The credentials are read once per connection and are not renewed. When the
+  lease TTL ends, the database user is dropped and `setKeyspace()` and driver
+  reconnects fail to authenticate; connect again to get new credentials.
+- `vaultPath` is not used by `connectWithAstraBundle()`.
+- Vault errors fail the connection with code `CONNECTION_FAILED`, for example
+  `Connection failed: reading database/creds/readonly from Vault: permission denied`.
 
 ---
 
