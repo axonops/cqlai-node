@@ -77,6 +77,12 @@ Connect to a Cassandra cluster and create a session.
 | `options.requestTimeout`    | `number` | -             | Request timeout in seconds                            |
 | `options.rsaPrivateKey`     | `string` | -             | PEM-encoded RSA private key for credential decryption |
 | `options.rsaPrivateKeyFile` | `string` | -             | Path to RSA private key file                          |
+| `options.sslCaFile`         | `string` | -             | CA certificate (PEM) the server certificate is checked against |
+| `options.sslCertfile`       | `string` | -             | Client certificate for mutual TLS (SSL is on when this or `sslCaFile` is set) |
+| `options.sslKeyfile`        | `string` | -             | Client private key for mutual TLS                     |
+| `options.sslValidate`       | `boolean`| `true`        | Check the server certificate chain against the CA; `false` skips verification. The server name is not checked unless `sslCheckHostname` is set, as in cqlsh, so a node reached by IP address works with a certificate that has no IP SAN |
+| `options.sslCheckHostname`  | `boolean`| `false`       | Also check the server name against the certificate. Ignored when `sslValidate` is `false` |
+| `options.cqlshrc`           | `string` | -             | cqlshrc file to read host, credentials and `[ssl]` `certfile`, `keyfile`, `ca_certs`, `validate` and `check_hostname` from; options given directly win |
 | `options.vaultPath`         | `string` | -             | Read the username and password from this Vault/OpenBao path, e.g. `database/creds/myrole`. See [Credentials from Vault or OpenBao](#credentials-from-vault-or-openbao) |
 | `options.vaultAddr`         | `string` | `BAO_ADDR` or `VAULT_ADDR` | Vault/OpenBao address                    |
 | `options.vaultToken`        | `string` | `BAO_TOKEN`, `VAULT_TOKEN` or `~/.vault-token` | Vault/OpenBao token, plaintext or RSA-encrypted |

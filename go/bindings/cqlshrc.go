@@ -31,13 +31,14 @@ type AuthenticationConfig struct {
 
 // SSLConfig holds [ssl] section values
 type SSLConfig struct {
-	Certfile     string `json:"certfile"`
-	Keyfile      string `json:"keyfile"`
-	CAFile       string `json:"ca_certs"`
-	Validate     bool   `json:"validate"`
-	Version      string `json:"version"`
-	UserKeyStore string `json:"userkeystore"`
-	UserKeyPass  string `json:"userkeypass"`
+	Certfile      string `json:"certfile"`
+	Keyfile       string `json:"keyfile"`
+	CAFile        string `json:"ca_certs"`
+	Validate      bool   `json:"validate"`
+	CheckHostname bool   `json:"check_hostname"`
+	Version       string `json:"version"`
+	UserKeyStore  string `json:"userkeystore"`
+	UserKeyPass   string `json:"userkeypass"`
 }
 
 // VariableManifestEntry represents a variable definition
@@ -138,6 +139,8 @@ func ParseCqlshrc(filePath string) (*CqlshrcConfig, error) {
 				config.SSL.Keyfile = value
 			case "validate":
 				config.SSL.Validate = strings.ToLower(value) == "true"
+			case "check_hostname":
+				config.SSL.CheckHostname = strings.ToLower(value) == "true"
 			case "version":
 				config.SSL.Version = value
 			case "userkeystore":
@@ -338,6 +341,8 @@ func ParseCqlshrcWithVariables(cqlshrcPath, manifestPath, valuesPath, workspaceI
 				config.SSL.Keyfile = value
 			case "validate":
 				config.SSL.Validate = strings.ToLower(value) == "true"
+			case "check_hostname":
+				config.SSL.CheckHostname = strings.ToLower(value) == "true"
 			case "version":
 				config.SSL.Version = value
 			case "userkeystore":

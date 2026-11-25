@@ -166,6 +166,9 @@ type SessionOptions struct {
 	SSLKeyfile  string `json:"sslKeyfile"`
 	SSLCAFile   string `json:"sslCaFile"`
 	SSLValidate *bool  `json:"sslValidate"` // Pointer to distinguish unset from false
+	// SSLCheckHostname also checks the server's name against its certificate. Off
+	// by default, as in cqlsh: sslValidate alone checks the certificate chain.
+	SSLCheckHostname *bool `json:"sslCheckHostname"`
 
 	// RSA credential decryption
 	RSAPrivateKey     string `json:"rsaPrivateKey"`     // PEM-encoded private key
@@ -284,6 +287,9 @@ func resolveSessionOptions(opts *SessionOptions) error {
 		if opts.SSLValidate == nil {
 			opts.SSLValidate = &config.SSL.Validate
 		}
+		if opts.SSLCheckHostname == nil {
+			opts.SSLCheckHostname = &config.SSL.CheckHostname
+		}
 	}
 
 	// Set defaults
@@ -302,6 +308,23 @@ func resolveSessionOptions(opts *SessionOptions) error {
 	}
 
 	return nil
+}
+
+// sslConfigFor is the TLS setting for the SSL connect options. Validation
+// checks the certificate chain; the name of the server is checked only when
+// SSLCheckHostname is set, so a node reached by IP address works with a
+// certificate that has no IP SAN.
+func sslConfigFor(opts *SessionOptions) *config.SSLConfig {
+	validate := opts.SSLValidate == nil || *opts.SSLValidate
+	checkHostname := opts.SSLCheckHostname != nil && *opts.SSLCheckHostname
+	return &config.SSLConfig{
+		Enabled:            true,
+		CertPath:           opts.SSLCertfile,
+		KeyPath:            opts.SSLKeyfile,
+		CAPath:             opts.SSLCAFile,
+		HostVerification:   validate && checkHostname,
+		InsecureSkipVerify: !validate,
+	}
 }
 
 // tryDecryptCredential attempts to decrypt a value using RSA private key
@@ -429,18 +452,7 @@ func CreateSession(optionsJSON *C.char) *C.char {
 
 	// Apply SSL options if provided
 	if opts.SSLCertfile != "" || opts.SSLCAFile != "" {
-		sslValidate := true
-		if opts.SSLValidate != nil {
-			sslValidate = *opts.SSLValidate
-		}
-		dbOpts.SSL = &config.SSLConfig{
-			Enabled:            true,
-			CertPath:           opts.SSLCertfile,
-			KeyPath:            opts.SSLKeyfile,
-			CAPath:             opts.SSLCAFile,
-			HostVerification:   sslValidate,
-			InsecureSkipVerify: !sslValidate,
-		}
+		dbOpts.SSL = sslConfigFor(&opts)
 	}
 
 	// Create session
@@ -941,18 +953,7 @@ func TestConnection(optionsJSON *C.char) *C.char {
 
 	// Apply SSL options if provided
 	if opts.SSLCertfile != "" || opts.SSLCAFile != "" {
-		sslValidate := true
-		if opts.SSLValidate != nil {
-			sslValidate = *opts.SSLValidate
-		}
-		dbOpts.SSL = &config.SSLConfig{
-			Enabled:            true,
-			CertPath:           opts.SSLCertfile,
-			KeyPath:            opts.SSLKeyfile,
-			CAPath:             opts.SSLCAFile,
-			HostVerification:   sslValidate,
-			InsecureSkipVerify: !sslValidate,
-		}
+		dbOpts.SSL = sslConfigFor(&opts)
 	}
 
 	// Create session
@@ -1077,18 +1078,7 @@ func TestConnectionWithID(optionsJSON *C.char) *C.char {
 
 	// Apply SSL options if provided
 	if opts.SSLCertfile != "" || opts.SSLCAFile != "" {
-		sslValidate := true
-		if opts.SSLValidate != nil {
-			sslValidate = *opts.SSLValidate
-		}
-		dbOpts.SSL = &config.SSLConfig{
-			Enabled:            true,
-			CertPath:           opts.SSLCertfile,
-			KeyPath:            opts.SSLKeyfile,
-			CAPath:             opts.SSLCAFile,
-			HostVerification:   sslValidate,
-			InsecureSkipVerify: !sslValidate,
-		}
+		dbOpts.SSL = sslConfigFor(&opts.SessionOptions)
 	}
 
 	// Create session (this is the blocking part)
