@@ -749,6 +749,26 @@ func createTLSConfig(sslConfig *config.SSLConfig, hostname string) (*tls.Config,
 		tlsConfig.RootCAs = caCertPool
 	}
 
+	// Certificate chain only: no hostname check, as cqlsh does for validate = true.
+	// The standard verification always checks the name, so it is done here.
+	if !sslConfig.InsecureSkipVerify && !sslConfig.HostVerification {
+		tlsConfig.InsecureSkipVerify = true // #nosec G402 - the chain is verified below
+		tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("no peer certificates")
+			}
+			intermediates := x509.NewCertPool()
+			for _, cert := range cs.PeerCertificates[1:] {
+				intermediates.AddCert(cert)
+			}
+			opts := x509.VerifyOptions{Roots: tlsConfig.RootCAs, Intermediates: intermediates}
+			if _, err := cs.PeerCertificates[0].Verify(opts); err != nil {
+				return fmt.Errorf("certificate verification failed: %v", err)
+			}
+			return nil
+		}
+	}
+
 	// Manual verification for legacy CN certificates
 	// We skip standard verification and manually check the certificate
 	if sslConfig.AllowLegacyCN && sslConfig.HostVerification {

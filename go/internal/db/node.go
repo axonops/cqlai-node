@@ -4,8 +4,11 @@ package db
 // file so the rest of the package can be copied over from cqlai as it is.
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
+
+	"github.com/axonops/cqlai-node/internal/config"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
@@ -35,4 +38,9 @@ func (s *Session) LastTraceID() string {
 		return ""
 	}
 	return fmt.Sprintf("%x", ids[len(ids)-1])
+}
+
+// NewTLSConfig is the TLS configuration for sslConfig and the server host.
+func NewTLSConfig(sslConfig *config.SSLConfig, host string) (*tls.Config, error) {
+	return createTLSConfig(sslConfig, host)
 }
